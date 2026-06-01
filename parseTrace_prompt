@@ -1,0 +1,10 @@
+You said: generate a python script to parse ftrace json format. It will output duration of trace event with specified function name. the map of function name to output section name are 2, depending on the backend name of json file. If backend contains gr(a.k.a.) graphite, use map CATAGORY_MAP_GR = {  
+    '::snap(': 'PipelineCreation',
+    '::addRecording': 'RSCreation',
+    '::submitToGpu': 'Submission',
+    '::checkForFinishedWork': 'Execution'
+} , otherwise use map of CATEGORY_MAP_NON_GR = {
+    '::flush': 'PipelineCreation',
+    '::submitCommandBuffer': 'Submission',
+    'Gpu::ReadPixels': 'Execution'
+}. you will have to parse case name, backend, skia version, ohos api version and iteration from either filename or the folder name. If file name contains those information, it will format as [case]-[backend]-m[skia version]-api[ohos api version]-v[iteration no].[extension]; otherwise it will be [case].[extension]. then try to parse from up to 2 levels of upper folder, where it might contains substring like m[skia version], api[ohos api version], and trace_[backend]. ohos sdk version could also in substring like ndk[ohos version], - or _ as connector are accepted. 
