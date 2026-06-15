@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Benchmark Analysis Tool - Version 2.6
+Benchmark Analysis Tool - Version 2.7
 ================================================================================
 Script to process multiple Excel files and generate comparison with version tracking.
 
@@ -14,6 +14,7 @@ Version History:
 - v2.4: Backup original backend pages into output workbook as separate sheets
 - v2.5: Separate comparison pages per version + dedicated cross-version page
 - v2.6: Extract summary columns from existing comparison page and append to new pages
+- v2.7: Report issues AND filter benchmarks to only include those existing in all backends
 
 Features:
 - Accepts 0-2 folder paths for trace analysis (optional)
@@ -27,12 +28,16 @@ Features:
 - Auto-increments output filename version number
 - Backs up original backend pages
 - Extracts summary columns from existing comparison page and appends to new pages
+- Reports benchmark cases that don't exist in all pages
+- Detects and reports duplicate benchmark names within each sheet
+- Reports columns (backends) that don't exist in all versions
+- **NEW: Filters benchmarks to only include those that exist in ALL backends per version**
 
 Usage: python script.py [<folder_path1>] [<folder_path2>] <excel_file1.xlsx> [<excel_file2.xlsx> ...]
 
 Author: Benchmark Analysis Tool
-Version: 2.6
-Date: 2026-06-11
+Version: 2.7
+Date: 2026-06-12
 ================================================================================
 """
 
@@ -52,9 +57,9 @@ from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-# Version constant - Minor version increment to 2.6
+# Version constant - Minor version increment to 2.7
 MAJOR_VERSION = 2
-MINOR_VERSION = 6
+MINOR_VERSION = 7
 VERSION = f"{MAJOR_VERSION}.{MINOR_VERSION}"
 
 def get_next_version_number(base_filename):
@@ -187,6 +192,156 @@ def extract_summary_columns_from_comparison(excel_file):
         print(f"  Error reading comparison sheet from {Path(excel_file).name}: {e}")
         return None
 
+def check_columns_coverage(version_groups, all_backends):
+    """Check and report columns (backends) that don't exist in all versions."""
+    print("\n" + "="*60)
+    print("📊 Column/Backend Coverage Analysis")
+    print("="*60)
+    
+    # For each backend, track which versions have it
+    backend_coverage = defaultdict(list)
+    
+    for version_name, version_data in version_groups.items():
+        # Get all backend names (without version suffix) for this version
+        version_backends = set()
+        for col_name in version_data['dataframes'].keys():
+            # Remove version suffix to get backend name
+            backend_name = col_name.rsplit('_', 1)[0] if '_' in col_name else col_name
+            version_backends.add(backend_name)
+        
+        for backend in version_backends:
+            backend_coverage[backend].append(version_name)
+    
+    # Find backends missing from some versions
+    all_versions = set(version_groups.keys())
+    missing_backends = {}
+    
+    for backend, present_versions in backend_coverage.items():
+        present_set = set(present_versions)
+        missing = all_versions - present_set
+        if missing:
+            missing_backends[backend] = {
+                'present_in': sorted(present_versions),
+                'missing_in': sorted(missing)
+            }
+    
+    if missing_backends:
+        print("\n⚠️  Backends missing from some versions:")
+        for backend, info in sorted(missing_backends.items()):
+            print(f"\n  Backend '{backend}':")
+            print(f"    - Present in: {', '.join(info['present_in'])}")
+            print(f"    - Missing in: {', '.join(info['missing_in'])}")
+    else:
+        print("\n✅ All backends are present in all versions!")
+    
+    # Also find backends that are only in a single version
+    single_version_backends = {b: v for b, v in backend_coverage.items() if len(v) == 1}
+    if single_version_backends:
+        print(f"\n📌 Backends unique to a single version ({len(single_version_backends)}):")
+        for backend, versions in sorted(single_version_backends.items()):
+            print(f"    - '{backend}' (only in {versions[0]})")
+    
+    print("="*60)
+    
+    return missing_backends, single_version_backends
+
+def check_duplicate_benchmarks(version_groups):
+    """Check and report duplicate benchmark names within each sheet."""
+    print("\n" + "="*60)
+    print("🔍 Duplicate Benchmark Detection")
+    print("="*60)
+    
+    duplicates_found = False
+    duplicate_report = {}
+    
+    for version_name, version_data in version_groups.items():
+        print(f"\n  Checking version: {version_name}")
+        version_duplicates = {}
+        
+        for sheet_name, df in version_data['sheets'].items():
+            # Check for duplicates in the bench column
+            bench_counts = df['bench'].value_counts()
+            duplicates = bench_counts[bench_counts > 1]
+            
+            if len(duplicates) > 0:
+                duplicates_found = True
+                version_duplicates[sheet_name] = duplicates.to_dict()
+                print(f"    ⚠️  Sheet '{sheet_name}' has {len(duplicates)} duplicate benchmark(s):")
+                for bench_name, count in duplicates.items():
+                    print(f"        - '{bench_name}' appears {count} times")
+            else:
+                print(f"    ✓ Sheet '{sheet_name}' has no duplicate benchmarks")
+        
+        if version_duplicates:
+            duplicate_report[version_name] = version_duplicates
+    
+    if not duplicates_found:
+        print("\n✅ No duplicate benchmarks found in any sheet!")
+    
+    print("="*60)
+    
+    return duplicate_report
+
+def check_missing_benchmarks(version_groups):
+    """Check and report benchmark cases that don't exist in all pages."""
+    print("\n" + "="*60)
+    print("📋 Benchmark Coverage Analysis")
+    print("="*60)
+    
+    # Get all unique benchmarks across all versions
+    all_benchmarks = set()
+    for version_data in version_groups.values():
+        for df in version_data['dataframes'].values():
+            all_benchmarks.update(df['bench'].tolist())
+    
+    # For each version, track which benchmarks are present
+    version_benchmarks = {}
+    for version_name, version_data in version_groups.items():
+        benchmarks = set()
+        for df in version_data['dataframes'].values():
+            benchmarks.update(df['bench'].tolist())
+        version_benchmarks[version_name] = benchmarks
+    
+    # Find benchmarks missing from each version
+    missing_report = {}
+    for version_name, benchmarks in version_benchmarks.items():
+        missing = all_benchmarks - benchmarks
+        if missing:
+            missing_report[version_name] = missing
+    
+    if missing_report:
+        print("\n⚠️  Missing Benchmarks Detected:")
+        for version_name, missing in sorted(missing_report.items()):
+            print(f"\n  Version '{version_name}' is missing {len(missing)} benchmark(s):")
+            for bench in sorted(missing):
+                # Find which versions have this benchmark
+                present_in = []
+                for v, b in version_benchmarks.items():
+                    if bench in b:
+                        present_in.append(v)
+                if present_in:
+                    print(f"    - {bench} (present in: {', '.join(present_in)})")
+                else:
+                    print(f"    - {bench} (present in: none)")
+    else:
+        print("\n✅ All benchmarks are present in all versions!")
+    
+    # Also check for benchmarks that are unique to a single version
+    benchmark_versions = defaultdict(list)
+    for version_name, benchmarks in version_benchmarks.items():
+        for bench in benchmarks:
+            benchmark_versions[bench].append(version_name)
+    
+    unique_benchmarks = {bench: versions for bench, versions in benchmark_versions.items() if len(versions) == 1}
+    if unique_benchmarks:
+        print(f"\n📌 Benchmarks unique to a single version ({len(unique_benchmarks)}):")
+        for bench, versions in sorted(unique_benchmarks.items()):
+            print(f"    - {bench} (only in {versions[0]})")
+    
+    print("="*60)
+    
+    return missing_report, unique_benchmarks, version_benchmarks
+
 def read_excel_sheets(excel_file, api_version):
     """Read all sheets from Excel file, excluding 'comparison' sheet."""
     try:
@@ -275,19 +430,31 @@ def read_multiple_excel_files(excel_files):
             
             # Collect unique backend names
             for col_name in dataframes.keys():
-                backend = col_name.split('_')[0] if '_' in col_name else col_name
+                backend = col_name.rsplit('_', 1)[0] if '_' in col_name else col_name
                 all_backends.add(backend)
     
     if len(all_dataframes) == 0:
         print("Error: No valid data loaded from any Excel file")
         sys.exit(1)
     
+    # Check for missing/extra backends across versions
+    missing_backends, single_version_backends = check_columns_coverage(version_groups, all_backends)
+    
+    # Check for duplicate benchmarks
+    duplicate_report = check_duplicate_benchmarks(version_groups)
+    
+    # Check for missing benchmarks
+    missing_report, unique_benchmarks, version_benchmarks = check_missing_benchmarks(version_groups)
+    
     print(f"\n📊 Summary: Loaded {len(all_dataframes)} backend columns from {len(excel_files)} files")
     print(f"   Backends found: {', '.join(sorted(all_backends))}")
     print(f"   Versions found: {', '.join(version_groups.keys())}")
     print(f"   Original sheets to backup: {len(all_original_sheets)}")
     
-    return all_dataframes, all_backends, version_info, version_groups, all_original_sheets, summary_columns
+    return (all_dataframes, all_backends, version_info, version_groups, 
+            all_original_sheets, summary_columns, missing_report, 
+            unique_benchmarks, duplicate_report, missing_backends, 
+            single_version_backends, version_benchmarks)
 
 def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     """Analyze ftrace JSON files for Ganesh backend."""
@@ -387,16 +554,27 @@ def analyze_ftrace_files(folder_path, benches, folder_exists, folder_name):
     else:  # ganesh
         return analyze_ftrace_files_ganesh(folder_path, benches, folder_name)
 
-def create_version_comparison_page(version_data, version_name, folder_paths, draw_types_maps, summary_columns):
-    """Create comparison page for a specific version."""
+def create_version_comparison_page(version_data, version_name, folder_paths, draw_types_maps, 
+                                    summary_columns, missing_benchmarks_for_version, version_benchmarks):
+    """Create comparison page for a specific version - only include benchmarks that exist in ALL backends."""
     dataframes = version_data['dataframes']
     
-    # Get unique benches
-    all_benches = set()
+    # Find benchmarks that exist in ALL backends for this version
+    backend_benchmarks = []
     for df in dataframes.values():
-        all_benches.update(df['bench'].tolist())
+        backend_benchmarks.append(set(df['bench'].tolist()))
     
-    benches = sorted(list(all_benches))
+    if backend_benchmarks:
+        # Find intersection of all benchmarks across all backends
+        common_benchmarks = set.intersection(*backend_benchmarks)
+        benches = sorted(list(common_benchmarks))
+        print(f"    Filtered benchmarks: {len(common_benchmarks)} common out of {len(set.union(*backend_benchmarks))} total")
+    else:
+        benches = []
+    
+    if not benches:
+        print(f"    WARNING: No common benchmarks found across all backends for version {version_name}")
+        return pd.DataFrame()
     
     # Create ordered ID column
     ordered_ids = list(range(1, len(benches) + 1))
@@ -407,13 +585,12 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
         'Bench': benches
     }
     
-    # Add mean columns for each backend
+    # Add mean columns for each backend (only for common benchmarks)
     backend_columns = {}  # Store column names for formula reference
     for col_name, df in sorted(dataframes.items()):
         mean_dict = dict(zip(df['bench'], df['mean']))
         
         # Remove everything starting from the last underscore
-        # Example: "grdawn_vk_api123" -> "grdawn_vk"
         display_name = col_name.rsplit('_', 1)[0] if '_' in col_name else col_name
         
         comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
@@ -423,7 +600,7 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     ratio_configs = [
         ('grdawn_vk vs glesdmsaa', 'grdawn_vk', 'glesdmsaa'),
         ('vkdmsaa vs glesdmsaa', 'vkdmsaa', 'glesdmsaa'),
-        ('grvk vs grdawn_vk', 'grvk', 'grdawn_vk')
+        ('grvk vs glesdmsaa', 'grvk', 'glesdmsaa')
     ]
     
     for ratio_name, num_backend, den_backend in ratio_configs:
@@ -433,18 +610,14 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     
     # Add summary columns from existing comparison page if provided
     if summary_columns:
-        print(f"    Appending {len(summary_columns)} summary columns from existing comparison page")
+        # Filter summary columns to only include common benchmarks
         for col_name, col_values in summary_columns.items():
-            # Ensure the summary column has the same length as benches
-            # Map values by bench name (assuming the summary column has a bench column)
-            # For now, we'll just append as-is and assume the order matches
+            # Assuming summary columns are in the same order as original benches
+            # For now, we'll just append as-is if length matches
             if len(col_values) == len(benches):
                 comparison_data[col_name] = col_values
-            else:
-                # Try to map by bench if the original had a bench column
-                print(f"    Warning: Summary column '{col_name}' length mismatch, skipping")
     
-    # Add trace analysis summary columns from folders if provided
+    # Add trace analysis summary columns from folders if provided (only for common benchmarks)
     if folder_paths and draw_types_maps:
         for idx, folder_path in enumerate(folder_paths):
             folder_name = Path(folder_path).name
@@ -454,18 +627,36 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     
     return pd.DataFrame(comparison_data)
 
-def create_cross_version_page(version_groups, all_backends, summary_columns):
-    """Create cross-version comparison page."""
+def create_cross_version_page(version_groups, all_backends, summary_columns, missing_report, version_benchmarks):
+    """Create cross-version comparison page - only include benchmarks that exist in ALL backends of ALL versions."""
     if len(version_groups) <= 1:
         return None
     
-    # Get all benches from all versions
-    all_benches = set()
-    for version_data in version_groups.values():
-        for df in version_data['dataframes'].values():
-            all_benches.update(df['bench'].tolist())
+    # Find benchmarks that exist in ALL backends of ALL versions
+    all_version_benchmarks = []
     
-    benches = sorted(list(all_benches))
+    for version_name, version_data in version_groups.items():
+        # Get benchmarks for this version that exist in all backends of this version
+        backend_benchmarks = []
+        for df in version_data['dataframes'].values():
+            backend_benchmarks.append(set(df['bench'].tolist()))
+        
+        if backend_benchmarks:
+            version_common = set.intersection(*backend_benchmarks)
+            all_version_benchmarks.append(version_common)
+            print(f"    Version {version_name}: {len(version_common)} common benchmarks out of {len(set.union(*backend_benchmarks))} total")
+    
+    if all_version_benchmarks:
+        # Find intersection across all versions
+        common_benchmarks = set.intersection(*all_version_benchmarks)
+        benches = sorted(list(common_benchmarks))
+        print(f"    Cross-version common benchmarks: {len(common_benchmarks)} across all versions")
+    else:
+        benches = []
+    
+    if not benches:
+        print(f"    WARNING: No common benchmarks found across all versions")
+        return pd.DataFrame()
     
     # Prepare comparison data
     comparison_data = {
@@ -473,14 +664,13 @@ def create_cross_version_page(version_groups, all_backends, summary_columns):
         'Bench': benches
     }
     
-    # Add columns for each backend across versions
+    # Add columns for each backend across versions (only for common benchmarks)
     versions = sorted(version_groups.keys())
-    column_names = {}  # Store column names for formula reference
+    column_names = {}
     
     for backend in sorted(all_backends):
         for version in versions:
             col_name = f"{backend}_{version}"
-            # Find the data for this backend and version
             version_data = version_groups[version]
             found = False
             for data_col_name, df in version_data['dataframes'].items():
@@ -508,29 +698,28 @@ def create_cross_version_page(version_groups, all_backends, summary_columns):
     
     # Add summary columns from existing comparison page if provided
     if summary_columns:
-        print(f"    Appending {len(summary_columns)} summary columns from existing comparison page")
         for col_name, col_values in summary_columns.items():
             if len(col_values) == len(benches):
                 comparison_data[col_name] = col_values
-            else:
-                print(f"    Warning: Summary column '{col_name}' length mismatch, skipping")
     
     return pd.DataFrame(comparison_data)
 
-def write_dataframe_with_formulas(writer, sheet_name, df, column_positions=None):
+def write_dataframe_with_formulas(writer, sheet_name, df):
     """Write dataframe to Excel with proper Excel formulas."""
+    if df.empty:
+        print(f"    WARNING: DataFrame for '{sheet_name}' is empty, skipping")
+        return
+    
     # First write the dataframe values without formulas
-    # Create a copy without the formula columns for initial write
     df_for_write = df.copy()
     
     # Replace formula placeholders with None for initial write
     for col in df_for_write.columns:
         if df_for_write[col].dtype == 'object':
-            # Check if this column contains formulas
             if len(df_for_write) > 0:
                 first_val = df_for_write[col].iloc[0]
                 if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
-                    df_for_write[col] = None  # Placeholder for now
+                    df_for_write[col] = None
     
     # Write the dataframe
     df_for_write.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -549,8 +738,7 @@ def write_dataframe_with_formulas(writer, sheet_name, df, column_positions=None)
         if len(df) > 0:
             first_val = df[col_name].iloc[0]
             if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
-                # This is a formula column
-                formula_expr = first_val[8:]  # Remove 'FORMULA:' prefix
+                formula_expr = first_val[8:]
                 parts = formula_expr.split('/')
                 if len(parts) == 2:
                     num_col_name = parts[0]
@@ -560,7 +748,6 @@ def write_dataframe_with_formulas(writer, sheet_name, df, column_positions=None)
                         num_col_letter = col_letters[num_col_name]
                         den_col_letter = col_letters[den_col_name]
                         
-                        # Add formula to each row
                         for row_idx in range(2, len(df) + 2):
                             formula = f"={num_col_letter}{row_idx}/{den_col_letter}{row_idx}"
                             cell = sheet.cell(row=row_idx, column=col_idx)
@@ -570,25 +757,22 @@ def write_dataframe_with_formulas(writer, sheet_name, df, column_positions=None)
 
 def apply_table_formatting_to_sheet(sheet, df):
     """Apply Excel table formatting to a sheet."""
-    # Determine the range
+    if df.empty:
+        return
+    
     start_row = 1
     start_col = 1
     end_row = len(df) + 1
     end_col = len(df.columns)
     
-    # Create table range reference
     table_range = f"{get_column_letter(start_col)}{start_row}:{get_column_letter(end_col)}{end_row}"
-    
-    # Create table
     table_name = f"Table_{sheet.title.replace(' ', '_')[:20]}"
     
-    # Remove existing table if it exists
     for existing_table in list(sheet.tables.keys()):
         if existing_table.startswith("Table_"):
             del sheet.tables[existing_table]
     
     table = Table(displayName=table_name, ref=table_range)
-    
     style = TableStyleInfo(
         name="TableStyleMedium9",
         showFirstColumn=False,
@@ -597,10 +781,8 @@ def apply_table_formatting_to_sheet(sheet, df):
         showColumnStripes=False
     )
     table.tableStyleInfo = style
-    
     sheet.add_table(table)
     
-    # Auto-adjust column widths
     for column in sheet.columns:
         max_length = 0
         column_letter = column[0].column_letter
@@ -613,7 +795,6 @@ def apply_table_formatting_to_sheet(sheet, df):
         adjusted_width = min(max_length + 2, 60)
         sheet.column_dimensions[column_letter].width = adjusted_width
     
-    # Style header row
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     for cell in sheet[1]:
@@ -621,7 +802,6 @@ def apply_table_formatting_to_sheet(sheet, df):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal='center', vertical='center')
     
-    # Freeze panes
     sheet.freeze_panes = sheet['B2']
 
 def backup_original_sheets(writer, all_original_sheets):
@@ -631,23 +811,16 @@ def backup_original_sheets(writer, all_original_sheets):
     print(f"\n📋 Backing up original backend pages...")
     
     for sheet_name, df in all_original_sheets.items():
-        # Clean sheet name (Excel has 31 char limit)
         clean_sheet_name = sheet_name[:31]
-        
-        # Check if sheet already exists and rename if needed
         final_sheet_name = clean_sheet_name
         counter = 1
         while final_sheet_name in workbook.sheetnames:
             final_sheet_name = f"{clean_sheet_name[:27]}_{counter}"
             counter += 1
         
-        # Write dataframe to sheet
         df.to_excel(writer, sheet_name=final_sheet_name, index=False)
-        
-        # Get the sheet and format it
         sheet = workbook[final_sheet_name]
         
-        # Auto-adjust column widths
         for column in sheet.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -660,7 +833,6 @@ def backup_original_sheets(writer, all_original_sheets):
             adjusted_width = min(max_length + 2, 50)
             sheet.column_dimensions[column_letter].width = adjusted_width
         
-        # Style header
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         for cell in sheet[1]:
@@ -668,12 +840,13 @@ def backup_original_sheets(writer, all_original_sheets):
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal='center', vertical='center')
         
-        # Freeze header row
         sheet.freeze_panes = sheet['A2']
-        
         print(f"  ✓ Backed up '{sheet_name}' -> sheet '{final_sheet_name}' ({len(df)} rows)")
 
-def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, output_file, version_num, all_original_sheets, summary_columns):
+def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
+                  output_file, version_num, all_original_sheets, summary_columns, 
+                  missing_report, unique_benchmarks, duplicate_report, 
+                  missing_backends, single_version_backends):
     """Print a summary of the analysis."""
     print("\n" + "="*60)
     print("✅ Analysis complete!")
@@ -693,26 +866,46 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_gro
         num_backends = len(version_groups[version]['dataframes'])
         print(f"  - {version}: {num_backends} backends")
     
+    # Print column/backend coverage summary
+    if missing_backends:
+        print(f"\n⚠️  Backends missing from some versions: {len(missing_backends)}")
+        for backend, info in missing_backends.items():
+            print(f"    - '{backend}' missing in: {', '.join(info['missing_in'])}")
+    
+    if single_version_backends:
+        print(f"\n📌 Backends unique to single version: {len(single_version_backends)}")
+    
+    # Print duplicate benchmark summary
+    if duplicate_report:
+        total_duplicates = sum(len(sheets) for sheets in duplicate_report.values())
+        print(f"\n⚠️  Duplicate Benchmarks Found: {total_duplicates} sheets with duplicates")
+    
+    # Print missing benchmark summary
+    if missing_report:
+        total_missing = sum(len(m) for m in missing_report.values())
+        print(f"\n⚠️  Missing Benchmarks: {total_missing} total missing entries across versions")
+    
+    if unique_benchmarks:
+        print(f"\n📌 Benchmarks unique to single version: {len(unique_benchmarks)}")
+    
     print(f"\n📋 Original sheets backed up: {len(all_original_sheets)}")
     
     if summary_columns:
         print(f"\n📋 Summary columns extracted from existing comparison: {len(summary_columns)}")
-        for col in summary_columns.keys():
-            print(f"  - {col}")
     
     print(f"\n📁 Output file: {output_file}")
     print(f"   Version number: v{version_num}")
     
     print("\n📑 Sheets in output workbook:")
-    print("  - [version]_comparison (one per API version)")
+    print("  - [version]_comparison (one per API version, filtered to common benchmarks)")
     if len(version_groups) > 1:
-        print("  - cross_version_comparison (cross-version analysis)")
-    print("  - backend_version (original data backups)")
+        print("  - cross_version_comparison (filtered to benchmarks common across ALL versions)")
+    print("  - backend_version (original data backups - unfiltered)")
     
     print("\n💡 Tips for using the Excel file:")
-    print("  1. Each version has its own comparison page with ratio columns")
-    print("  2. Cross-version page shows side-by-side comparison across versions")
-    print("  3. Original backend data is preserved in separate sheets")
+    print("  1. Each version page only includes benchmarks that exist in ALL backends of that version")
+    print("  2. Cross-version page only includes benchmarks that exist in ALL backends of ALL versions")
+    print("  3. Original backup sheets contain complete unfiltered data")
     print("  4. Use drop-down arrows in headers to sort/filter data")
     print("  5. First row and column are frozen for easy scrolling")
 
@@ -737,7 +930,10 @@ def main():
         print(f"  - {excel_file}")
     
     # Read all Excel files
-    all_dataframes, all_backends, version_info, version_groups, all_original_sheets, summary_columns = read_multiple_excel_files(excel_files)
+    (all_dataframes, all_backends, version_info, version_groups, 
+     all_original_sheets, summary_columns, missing_report, 
+     unique_benchmarks, duplicate_report, missing_backends, 
+     single_version_backends, version_benchmarks) = read_multiple_excel_files(excel_files)
     
     # Get unique benches for JSON analysis
     all_benches = set()
@@ -767,36 +963,47 @@ def main():
         # Create comparison page for each version
         for version_name, version_data in version_groups.items():
             print(f"\n  Creating comparison page for version: {version_name}")
-            version_df = create_version_comparison_page(version_data, version_name, folder_paths, draw_types_maps, summary_columns)
-            sheet_name = f"{version_name}_comparison"[:31]
+            missing_for_version = missing_report.get(version_name, set())
+            version_df = create_version_comparison_page(
+                version_data, version_name, folder_paths, draw_types_maps, 
+                summary_columns, missing_for_version, version_benchmarks
+            )
             
-            # Write using special function that handles formulas
-            write_dataframe_with_formulas(writer, sheet_name, version_df, None)
-            
-            # Apply formatting
-            workbook = writer.book
-            sheet = workbook[sheet_name]
-            apply_table_formatting_to_sheet(sheet, version_df)
-            print(f"    ✓ Created '{sheet_name}' with {len(version_df.columns)} columns")
+            if not version_df.empty:
+                sheet_name = f"{version_name}_comparison"[:31]
+                write_dataframe_with_formulas(writer, sheet_name, version_df)
+                
+                workbook = writer.book
+                sheet = workbook[sheet_name]
+                apply_table_formatting_to_sheet(sheet, version_df)
+                print(f"    ✓ Created '{sheet_name}' with {len(version_df)} benchmarks, {len(version_df.columns)} columns")
+            else:
+                print(f"    ✗ Skipping '{version_name}_comparison' - no common benchmarks found")
         
         # Create cross-version comparison page if multiple versions
         if len(version_groups) > 1:
             print(f"\n  Creating cross-version comparison page")
-            cross_version_df = create_cross_version_page(version_groups, all_backends, summary_columns)
-            if cross_version_df is not None:
-                write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df, None)
+            cross_version_df = create_cross_version_page(
+                version_groups, all_backends, summary_columns, missing_report, version_benchmarks
+            )
+            if cross_version_df is not None and not cross_version_df.empty:
+                write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df)
                 
-                # Apply formatting
                 workbook = writer.book
                 sheet = workbook['cross_version_comparison']
                 apply_table_formatting_to_sheet(sheet, cross_version_df)
-                print(f"    ✓ Created 'cross_version_comparison' with {len(cross_version_df.columns)} columns")
+                print(f"    ✓ Created 'cross_version_comparison' with {len(cross_version_df)} benchmarks, {len(cross_version_df.columns)} columns")
+            else:
+                print(f"    ✗ Skipping 'cross_version_comparison' - no common benchmarks across all versions")
         
         # Backup original backend sheets
         backup_original_sheets(writer, all_original_sheets)
     
     # Print summary
-    print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, output_file, version_num, all_original_sheets, summary_columns)
+    print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
+                  output_file, version_num, all_original_sheets, summary_columns, 
+                  missing_report, unique_benchmarks, duplicate_report, 
+                  missing_backends, single_version_backends)
     
     print("\n" + "="*60)
     print(f"Benchmark Analysis Tool v{VERSION} - Execution Complete")

@@ -199,14 +199,46 @@ def analyze_ftrace_files(folder_path, benches, folder_exists, folder_name):
     else:  # ganesh
         return analyze_ftrace_files_ganesh(folder_path, benches, folder_name)
 
-def create_comparison_page(dataframes, draw_types_maps, folder_paths):
-    """Create the comparison dataframe with summary columns for each folder."""
-    # Get unique benches from all CSVs
-    all_benches = set()
-    for df in dataframes.values():
-        all_benches.update(df['bench'].tolist())
+def find_common_benches(dataframes):
+    """Find benches that exist in ALL CSV files and report missing ones."""
+    # Get sets of benches from each CSV
+    bench_sets = []
+    for csv_file, df in dataframes.items():
+        bench_set = set(df['bench'].tolist())
+        bench_sets.append(bench_set)
+        print(f"\n  {Path(csv_file).name}: {len(bench_set)} benchmarks")
     
-    benches = sorted(list(all_benches))
+    # Find intersection (benches in all files)
+    common_benches = set.intersection(*bench_sets) if bench_sets else set()
+    
+    # Report missing benchmarks
+    print("\n📊 Benchmark Analysis:")
+    print(f"  Total unique benchmarks across all files: {len(set.union(*bench_sets))}")
+    print(f"  Benchmarks present in ALL files: {len(common_benches)}")
+    
+    # Check each file for missing benchmarks
+    all_benches_union = set.union(*bench_sets)
+    for bench in sorted(all_benches_union):
+        if bench not in common_benches:
+            missing_in = []
+            for csv_file, bench_set in zip(dataframes.keys(), bench_sets):
+                if bench not in bench_set:
+                    missing_in.append(Path(csv_file).name)
+            print(f"  ⚠️  '{bench}' - missing in: {', '.join(missing_in)}")
+    
+    return common_benches
+
+def create_comparison_page(dataframes, draw_types_maps, folder_paths, common_benches):
+    """Create the comparison dataframe with summary columns for each folder.
+    Only includes benchmarks that exist in ALL CSV files.
+    """
+    # Convert to sorted list for consistent ordering
+    benches = sorted(list(common_benches))
+    
+    if not benches:
+        print("\n❌ Error: No common benchmarks found across all CSV files!")
+        print("   Please ensure at least one benchmark name appears in all CSV files.")
+        sys.exit(1)
     
     # Create ordered ID column
     ordered_ids = list(range(1, len(benches) + 1))
@@ -220,6 +252,7 @@ def create_comparison_page(dataframes, draw_types_maps, folder_paths):
     # Add mean columns for each CSV (named after filename/backend)
     for csv_file, df in dataframes.items():
         backend_name = Path(csv_file).stem  # Remove .csv extension
+        # Create dictionary only for common benches
         mean_dict = dict(zip(df['bench'], df['mean']))
         comparison_data[backend_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
     
@@ -263,9 +296,9 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes):
             'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
         },
         {
-            'name': 'grvk vs grdawn_vk',
+            'name': 'grvk vs glesdmsaa',
             'numerator_patterns': ['grvk', 'gr-vk', 'grvk'],
-            'denominator_patterns': ['grdawn_vk', 'grdawn-vk', 'grdawnvk']
+            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
         }
     ]
     
@@ -491,7 +524,7 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes,
     for csv_file in dataframes.keys():
         print(f"  - {Path(csv_file).name}: {len(dataframes[csv_file])} rows")
     
-    print(f"\n📈 Comparison page: {len(comparison_df)} benchmarks")
+    print(f"\n📈 Comparison page: {len(comparison_df)} benchmarks (common across all files)")
     print(f"   Base columns: ID, Bench, backend columns ({len(dataframes)}), summary columns ({len(folder_paths)})")
     print(f"   Ratio columns added: {len(ratio_columns)} ({', '.join(ratio_columns)})")
     
@@ -527,25 +560,23 @@ def main():
     print("\n📖 Reading CSV files...")
     dataframes = read_csv_files(csv_files)
     
-    # Get unique benches for JSON analysis
-    all_benches = set()
-    for df in dataframes.values():
-        all_benches.update(df['bench'].tolist())
-    print(f"\n📋 Found {len(all_benches)} unique benchmarks")
+    # Find common benches across all CSV files and report missing ones
+    print("\n🔍 Finding common benchmarks across all CSV files...")
+    common_benches = find_common_benches(dataframes)
     
-    # Analyze ftrace JSON files for each folder
+    # Analyze ftrace JSON files for each folder (only for common benches)
     print("\n🔍 Analyzing ftrace JSON files...")
     draw_types_maps = []
     for idx, folder_path in enumerate(folder_paths):
         folder_name = Path(folder_path).name
         print(f"\n  Processing folder {idx + 1}: {folder_name}")
         folder_exists = folder_exists_list[idx] if idx < len(folder_exists_list) else False
-        draw_types_map = analyze_ftrace_files(folder_path, all_benches, folder_exists, folder_name)
+        draw_types_map = analyze_ftrace_files(folder_path, common_benches, folder_exists, folder_name)
         draw_types_maps.append(draw_types_map)
     
-    # Create comparison dataframe with summary columns
+    # Create comparison dataframe with summary columns (only common benches)
     print("\n📊 Creating comparison page...")
-    comparison_df = create_comparison_page(dataframes, draw_types_maps, folder_paths)
+    comparison_df = create_comparison_page(dataframes, draw_types_maps, folder_paths, common_benches)
     
     # Generate output filename
     output_file = "combined.xlsx"
@@ -556,7 +587,7 @@ def main():
         # Write comparison sheet as first sheet
         comparison_df.to_excel(writer, sheet_name='comparison', index=False)
         
-        # Write individual CSV sheets
+        # Write individual CSV sheets (original full data)
         for csv_file, df in dataframes.items():
             sheet_name = Path(csv_file).stem[:31]  # Excel sheet name max 31 chars
             df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -589,10 +620,13 @@ def main():
         display_cols.append(summary_cols[0])
     
     # Display the dataframe sample (without ratio columns which are Excel-only formulas)
-    print(comparison_df[display_cols].head().to_string())
-    print("\n   Note: Ratio columns (grdawn_vk vs glesdmsaa, vkdmsaa vs glesdmsaa, grvk vs grdawn_vk)")
-    print("         are Excel formulas and not shown in this preview. They will appear when you")
-    print("         open the Excel file and will automatically calculate based on the backend columns.")
+    if len(comparison_df) > 0:
+        print(comparison_df[display_cols].head().to_string())
+        print("\n   Note: Ratio columns (grdawn_vk vs glesdmsaa, vkdmsaa vs glesdmsaa, grvk vs grdawn_vk)")
+        print("         are Excel formulas and not shown in this preview. They will appear when you")
+        print("         open the Excel file and will automatically calculate based on the backend columns.")
+    else:
+        print("\n   ⚠️  No common benchmarks found to display!")
     
     print("\n📁 Output file details:")
     print(f"  - File: {output_file}")
@@ -612,6 +646,7 @@ def main():
     print("  4. Table formatting updates automatically when you add/remove data")
     print("  5. All formulas recalculate when source data changes")
     print("  6. Summary columns show trace analysis results (draw types per flush)")
+    print("  7. Individual CSV sheets contain ALL original data, comparison sheet only shows common benchmarks")
     
     print("\n" + "="*60)
 
