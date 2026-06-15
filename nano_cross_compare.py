@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Benchmark Analysis Tool - Version 2.7
+Benchmark Analysis Tool - Version 2.9
 ================================================================================
 Script to process multiple Excel files and generate comparison with version tracking.
 
@@ -15,29 +15,23 @@ Version History:
 - v2.5: Separate comparison pages per version + dedicated cross-version page
 - v2.6: Extract summary columns from existing comparison page and append to new pages
 - v2.7: Report issues AND filter benchmarks to only include those existing in all backends
+- v2.8: Detect Skia version (m[0-9]+) and intelligently determine baseline/compare versions
+- v2.9: Cache backend name extraction, simplify baseline handling, improve performance
 
 Features:
 - Accepts 0-2 folder paths for trace analysis (optional)
 - Accepts MULTIPLE Excel files with multiple sheets (one per backend)
-- Detects API version from filename (api[0-9]+ pattern)
-- Each sheet must contain 'bench' and 'mean' columns
-- Generates separate comparison page for EACH version
-- Creates dedicated cross-version comparison page
-- Adds version-specific ratio columns (3 ratios per version)
-- Optional ftrace JSON analysis for draw types
-- Auto-increments output filename version number
-- Backs up original backend pages
-- Extracts summary columns from existing comparison page and appends to new pages
-- Reports benchmark cases that don't exist in all pages
-- Detects and reports duplicate benchmark names within each sheet
-- Reports columns (backends) that don't exist in all versions
-- **NEW: Filters benchmarks to only include those that exist in ALL backends per version**
+- Detects API version (api[0-9]+) AND Skia version (m[0-9]+) from filename
+- Intelligently determines baseline and compare versions
+- Generates comparison pages with baseline as reference
+- Auto-increments output filename version number with baseline info
+- Caches backend name extraction for better performance
 
 Usage: python script.py [<folder_path1>] [<folder_path2>] <excel_file1.xlsx> [<excel_file2.xlsx> ...]
 
 Author: Benchmark Analysis Tool
-Version: 2.7
-Date: 2026-06-12
+Version: 2.9
+Date: 2026-06-15
 ================================================================================
 """
 
@@ -57,10 +51,104 @@ from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-# Version constant - Minor version increment to 2.7
+# Version constant
 MAJOR_VERSION = 2
-MINOR_VERSION = 7
+MINOR_VERSION = 9
 VERSION = f"{MAJOR_VERSION}.{MINOR_VERSION}"
+
+def extract_versions_from_filename(filename):
+    """Extract API version (api[0-9]+) and Skia version (m[0-9]+) from filename."""
+    api_version = None
+    skia_version = None
+    
+    # Extract API version
+    api_match = re.search(r'api(\d+)', filename, re.IGNORECASE)
+    if api_match:
+        api_version = f"api{api_match.group(1)}"
+    
+    # Extract Skia version (m[0-9]+) - no underscore required
+    skia_match = re.search(r'm(\d+)', filename, re.IGNORECASE)
+    if skia_match:
+        skia_version = f"m{skia_match.group(1)}"
+    
+    return api_version, skia_version
+
+def determine_baseline_and_compare(version_groups):
+    """
+    Determine which version is baseline and which is compare.
+    Returns baseline_version, compare_versions (clean), comparison_type
+    """
+    versions = list(version_groups.keys())
+    
+    if len(versions) <= 1:
+        return versions[0] if versions else None, [], "single"
+    
+    # Extract components from version strings
+    version_components = {}
+    for version in versions:
+        api_match = re.search(r'api(\d+)', version)
+        skia_match = re.search(r'm(\d+)', version)
+        version_components[version] = {
+            'api': f"api{api_match.group(1)}" if api_match else None,
+            'skia': f"m{skia_match.group(1)}" if skia_match else None,
+            'full': version
+        }
+    
+    # Check if all versions have same Skia version
+    skia_versions = set()
+    for v in version_components.values():
+        if v['skia']:
+            skia_versions.add(v['skia'])
+    
+    if len(skia_versions) == 1 and len(versions) > 1:
+        # Same Skia version across all files - use Skia as baseline, API as compare
+        baseline_version = list(skia_versions)[0]
+        # Compare versions are the API versions only (extract from full version)
+        compare_versions = []
+        for version in versions:
+            if version != baseline_version:
+                # Extract API part from the full version
+                api_match = re.search(r'api(\d+)', version)
+                if api_match:
+                    compare_versions.append(f"api{api_match.group(1)}")
+                else:
+                    compare_versions.append(version)
+        comparison_type = "same_skia_different_api"
+        print(f"\n📌 Detected: Same Skia version ({baseline_version}) across files")
+        print(f"   Using Skia version as baseline, API versions as compare: {compare_versions}")
+        return baseline_version, compare_versions, comparison_type
+    
+    # Check if all versions have same API version
+    api_versions = set()
+    for v in version_components.values():
+        if v['api']:
+            api_versions.add(v['api'])
+    
+    if len(api_versions) == 1 and len(versions) > 1:
+        # Same API version across all files - use API as baseline, Skia as compare
+        baseline_version = list(api_versions)[0]
+        # Compare versions are the Skia versions only (extract from full version)
+        compare_versions = []
+        for version in versions:
+            if version != baseline_version:
+                # Extract Skia part from the full version
+                skia_match = re.search(r'm(\d+)', version)
+                if skia_match:
+                    compare_versions.append(f"m{skia_match.group(1)}")
+                else:
+                    compare_versions.append(version)
+        comparison_type = "same_api_different_skia"
+        print(f"\n📌 Detected: Same API version ({baseline_version}) across files")
+        print(f"   Using API version as baseline, Skia versions as compare: {compare_versions}")
+        return baseline_version, compare_versions, comparison_type
+    
+    # Default: use first version as baseline, others as compare (full versions)
+    baseline_version = versions[0]
+    compare_versions = versions[1:]
+    comparison_type = "mixed_versions"
+    print(f"\n📌 No clear version pattern detected")
+    print(f"   Using '{baseline_version}' as baseline")
+    return baseline_version, compare_versions, comparison_type
 
 def get_next_version_number(base_filename):
     """Get the next available version number for output filename."""
@@ -80,15 +168,10 @@ def get_next_version_number(base_filename):
     
     return next_version
 
-def generate_output_filename(excel_files, folder_paths):
-    """Generate output filename with version number."""
-    # Determine base name based on input
-    if len(excel_files) == 1:
-        # Single file: use basename + "_benchmark_comparison"
-        base_name = f"{Path(excel_files[0]).stem}_benchmark_comparison"
-    else:
-        # Multiple files: use benchmark_comparison
-        base_name = "benchmark_comparison"
+def generate_output_filename(baseline_version):
+    """Generate output filename with baseline version."""
+    # Create base name: [baseline_version]_benchmark_comparison
+    base_name = f"{baseline_version}_benchmark_comparison"
     
     # Get next version number
     version_num = get_next_version_number(base_name)
@@ -140,13 +223,6 @@ def validate_arguments():
             sys.exit(1)
     
     return folder_paths, excel_files, folder_exists
-
-def extract_api_version(filename):
-    """Extract API version from filename using pattern api[0-9]+."""
-    match = re.search(r'api(\d+)', filename, re.IGNORECASE)
-    if match:
-        return f"api{match.group(1)}"
-    return None
 
 def detect_backend_type(folder_path):
     """Detect backend type from folder name."""
@@ -205,8 +281,8 @@ def check_columns_coverage(version_groups, all_backends):
         # Get all backend names (without version suffix) for this version
         version_backends = set()
         for col_name in version_data['dataframes'].keys():
-            # Remove version suffix to get backend name
-            backend_name = col_name.rsplit('_', 1)[0] if '_' in col_name else col_name
+            # Get backend name from mapping
+            backend_name = version_data['backend_mapping'].get(col_name, col_name)
             version_backends.add(backend_name)
         
         for backend in version_backends:
@@ -342,13 +418,15 @@ def check_missing_benchmarks(version_groups):
     
     return missing_report, unique_benchmarks, version_benchmarks
 
-def read_excel_sheets(excel_file, api_version):
+def read_excel_sheets(excel_file, version_tag):
     """Read all sheets from Excel file, excluding 'comparison' sheet."""
     try:
         # Dictionary to store dataframes with backend names
         dataframes = {}
         # Dictionary to store original sheet data for backup
         original_sheets = {}
+        # Dictionary to store backend name mapping
+        backend_mapping = {}
         
         # Load the workbook
         wb = load_workbook(excel_file, data_only=True)
@@ -371,16 +449,25 @@ def read_excel_sheets(excel_file, api_version):
             # Store original sheet data for backup
             original_sheets[sheet_name] = df
             
-            # Create column name with version
-            column_name = f"{sheet_name}_{api_version}" if api_version else sheet_name
+            # Extract backend name by removing version suffixes (any part with digits)
+            parts = sheet_name.split('_')
+            backend_parts = []
+            for part in parts:
+                if not any(char.isdigit() for char in part):
+                    backend_parts.append(part)
+            backend_name = '_'.join(backend_parts)
+            
+            # Create column name with version tag
+            column_name = f"{sheet_name}_{version_tag}" if version_tag else sheet_name
             dataframes[column_name] = df
-            print(f"  - Loaded sheet '{sheet_name}' -> column '{column_name}': {len(df)} rows")
+            backend_mapping[column_name] = backend_name
+            print(f"  - Loaded sheet '{sheet_name}' -> column '{column_name}' (backend: {backend_name}): {len(df)} rows")
         
-        return dataframes, original_sheets
+        return dataframes, original_sheets, backend_mapping
         
     except Exception as e:
         print(f"Error reading Excel file '{excel_file}': {e}")
-        return None, None
+        return None, None, None
 
 def read_multiple_excel_files(excel_files):
     """Read all Excel files and combine their data."""
@@ -388,7 +475,7 @@ def read_multiple_excel_files(excel_files):
     all_backends = set()
     version_info = {}
     all_original_sheets = {}
-    version_groups = defaultdict(dict)  # Group data by API version
+    version_groups = defaultdict(dict)  # Group data by version tag
     
     print(f"\n📖 Reading Excel files...")
     
@@ -400,42 +487,58 @@ def read_multiple_excel_files(excel_files):
     
     for excel_file in excel_files:
         filename = Path(excel_file).stem
-        api_version = extract_api_version(filename)
+        api_version, skia_version = extract_versions_from_filename(filename)
         
-        if api_version:
-            print(f"\n📖 Reading Excel file: {Path(excel_file).name} (detected version: {api_version})")
+        # Create version tag (prioritize showing both if available)
+        if api_version and skia_version:
+            version_tag = f"{api_version}_{skia_version}"
+            print(f"\n📖 Reading Excel file: {Path(excel_file).name} (API: {api_version}, Skia: {skia_version})")
+        elif api_version:
+            version_tag = api_version
+            print(f"\n📖 Reading Excel file: {Path(excel_file).name} (API: {api_version})")
+        elif skia_version:
+            version_tag = skia_version
+            print(f"\n📖 Reading Excel file: {Path(excel_file).name} (Skia: {skia_version})")
         else:
+            version_tag = "default"
             print(f"\n📖 Reading Excel file: {Path(excel_file).name} (no version detected)")
-            api_version = "default"
         
-        dataframes, original_sheets = read_excel_sheets(excel_file, api_version)
+        dataframes, original_sheets, backend_mapping = read_excel_sheets(excel_file, version_tag)
         
-        if dataframes and original_sheets:
+        if dataframes and original_sheets and backend_mapping:
             all_dataframes.update(dataframes)
             
             # Store original sheets with version info
             for sheet_name, df in original_sheets.items():
-                backup_sheet_name = f"{sheet_name}_{api_version}"
+                backup_sheet_name = f"{sheet_name}_{version_tag}"
                 all_original_sheets[backup_sheet_name] = df
             
             # Group data by version
-            version_groups[api_version]['dataframes'] = dataframes
-            version_groups[api_version]['file'] = excel_file
-            version_groups[api_version]['sheets'] = original_sheets
+            version_groups[version_tag]['dataframes'] = dataframes
+            version_groups[version_tag]['file'] = excel_file
+            version_groups[version_tag]['sheets'] = original_sheets
+            version_groups[version_tag]['backend_mapping'] = backend_mapping
+            version_groups[version_tag]['api'] = api_version
+            version_groups[version_tag]['skia'] = skia_version
             
-            version_info[api_version] = {
+            version_info[version_tag] = {
                 'file': excel_file,
-                'columns': list(dataframes.keys())
+                'columns': list(dataframes.keys()),
+                'api': api_version,
+                'skia': skia_version,
+                'backend_mapping': backend_mapping
             }
             
-            # Collect unique backend names
-            for col_name in dataframes.keys():
-                backend = col_name.rsplit('_', 1)[0] if '_' in col_name else col_name
-                all_backends.add(backend)
+            # Collect unique backend names from the mapping
+            for backend_name in backend_mapping.values():
+                all_backends.add(backend_name)
     
     if len(all_dataframes) == 0:
         print("Error: No valid data loaded from any Excel file")
         sys.exit(1)
+    
+    # Determine baseline and compare versions
+    baseline_version, compare_versions, comparison_type = determine_baseline_and_compare(version_groups)
     
     # Check for missing/extra backends across versions
     missing_backends, single_version_backends = check_columns_coverage(version_groups, all_backends)
@@ -449,12 +552,15 @@ def read_multiple_excel_files(excel_files):
     print(f"\n📊 Summary: Loaded {len(all_dataframes)} backend columns from {len(excel_files)} files")
     print(f"   Backends found: {', '.join(sorted(all_backends))}")
     print(f"   Versions found: {', '.join(version_groups.keys())}")
+    print(f"   Baseline version: {baseline_version}")
+    print(f"   Compare versions: {', '.join(compare_versions) if compare_versions else 'None'}")
     print(f"   Original sheets to backup: {len(all_original_sheets)}")
     
     return (all_dataframes, all_backends, version_info, version_groups, 
             all_original_sheets, summary_columns, missing_report, 
             unique_benchmarks, duplicate_report, missing_backends, 
-            single_version_backends, version_benchmarks)
+            single_version_backends, version_benchmarks, baseline_version, 
+            compare_versions, comparison_type)
 
 def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     """Analyze ftrace JSON files for Ganesh backend."""
@@ -555,9 +661,11 @@ def analyze_ftrace_files(folder_path, benches, folder_exists, folder_name):
         return analyze_ftrace_files_ganesh(folder_path, benches, folder_name)
 
 def create_version_comparison_page(version_data, version_name, folder_paths, draw_types_maps, 
-                                    summary_columns, missing_benchmarks_for_version, version_benchmarks):
-    """Create comparison page for a specific version - only include benchmarks that exist in ALL backends."""
+                                    summary_columns, missing_benchmarks_for_version, 
+                                    version_benchmarks, baseline_version, is_baseline=False):
+    """Create comparison page for a specific version."""
     dataframes = version_data['dataframes']
+    backend_mapping = version_data['backend_mapping']
     
     # Find benchmarks that exist in ALL backends for this version
     backend_benchmarks = []
@@ -590,13 +698,14 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     for col_name, df in sorted(dataframes.items()):
         mean_dict = dict(zip(df['bench'], df['mean']))
         
-        # Remove everything starting from the last underscore
-        display_name = col_name.rsplit('_', 1)[0] if '_' in col_name else col_name
+        # Get backend name from mapping (already extracted)
+        display_name = backend_mapping.get(col_name, col_name)
         
         comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
         backend_columns[display_name] = display_name
     
-    # Add ratio columns for this version (store as formula placeholders)
+    # Add ratio columns for this version using baseline version (store as formula placeholders)
+    # Use baseline_version for ratio calculations
     ratio_configs = [
         ('grdawn_vk vs glesdmsaa', 'grdawn_vk', 'glesdmsaa'),
         ('vkdmsaa vs glesdmsaa', 'vkdmsaa', 'glesdmsaa'),
@@ -610,10 +719,7 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     
     # Add summary columns from existing comparison page if provided
     if summary_columns:
-        # Filter summary columns to only include common benchmarks
         for col_name, col_values in summary_columns.items():
-            # Assuming summary columns are in the same order as original benches
-            # For now, we'll just append as-is if length matches
             if len(col_values) == len(benches):
                 comparison_data[col_name] = col_values
     
@@ -627,8 +733,9 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     
     return pd.DataFrame(comparison_data)
 
-def create_cross_version_page(version_groups, all_backends, summary_columns, missing_report, version_benchmarks):
-    """Create cross-version comparison page - only include benchmarks that exist in ALL backends of ALL versions."""
+def create_cross_version_page(version_groups, all_backends, summary_columns, missing_report, 
+                               version_benchmarks, baseline_version, compare_versions, comparison_type):
+    """Create cross-version comparison page with baseline as reference."""
     if len(version_groups) <= 1:
         return None
     
@@ -658,43 +765,76 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
         print(f"    WARNING: No common benchmarks found across all versions")
         return pd.DataFrame()
     
+    # Create mapping between full version tag and compare version
+    version_mapping = {}
+    for full_tag in version_groups.keys():
+        if comparison_type == "same_skia_different_api":
+            # Extract API part as compare version
+            api_match = re.search(r'api(\d+)', full_tag)
+            if api_match:
+                compare_ver = f"api{api_match.group(1)}"
+                version_mapping[full_tag] = compare_ver
+            else:
+                version_mapping[full_tag] = full_tag
+        elif comparison_type == "same_api_different_skia":
+            # Extract Skia part as compare version
+            skia_match = re.search(r'm(\d+)', full_tag)
+            if skia_match:
+                compare_ver = f"m{skia_match.group(1)}"
+                version_mapping[full_tag] = compare_ver
+            else:
+                version_mapping[full_tag] = full_tag
+        else:
+            # Mixed case - use full tag as is
+            version_mapping[full_tag] = full_tag
+    
+    print(f"    Version mapping: {version_mapping}")
+    
     # Prepare comparison data
     comparison_data = {
         'ID': list(range(1, len(benches) + 1)),
         'Bench': benches
     }
     
-    # Add columns for each backend across versions (only for common benchmarks)
-    versions = sorted(version_groups.keys())
+    # Track column names for formula references
     column_names = {}
     
-    for backend in sorted(all_backends):
-        for version in versions:
-            col_name = f"{backend}_{version}"
-            version_data = version_groups[version]
-            found = False
-            for data_col_name, df in version_data['dataframes'].items():
-                if data_col_name.startswith(f"{backend}_") or data_col_name == backend:
-                    mean_dict = dict(zip(df['bench'], df['mean']))
-                    comparison_data[col_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
-                    column_names[col_name] = col_name
-                    found = True
-                    break
-            if not found:
-                comparison_data[col_name] = [float('nan')] * len(benches)
-                column_names[col_name] = col_name
+    # Add all mean columns using compare version as column name
+    for full_tag, version_data in version_groups.items():
+        compare_ver = version_mapping[full_tag]
+        backend_mapping = version_data.get('backend_mapping', {})
+        
+        for col_name, df in sorted(version_data['dataframes'].items()):
+            backend = backend_mapping.get(col_name, col_name)
+            mean_dict = dict(zip(df['bench'], df['mean']))
+            # Use compare version as part of column name
+            display_name = f"{backend}_{compare_ver}"
+            comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
+            column_names[display_name] = display_name
     
-    # Add ratio columns comparing each version to the first version
-    if len(versions) >= 2:
-        base_version = versions[0]
-        for backend in sorted(all_backends):
-            base_col = f"{backend}_{base_version}"
-            if base_col in column_names:
-                for target_version in versions[1:]:
-                    target_col = f"{backend}_{target_version}"
-                    if target_col in column_names:
-                        ratio_name = f"{backend}_{target_version}_vs_{base_version}"
-                        comparison_data[ratio_name] = [f"FORMULA:{target_col}/{base_col}"] * len(benches)
+    # Add ratio columns comparing all possible pairs of compare versions
+    # Also include baseline version in the pairs
+    all_versions = [baseline_version] + compare_versions
+    backends = ['grdawn_vk', 'glesdmsaa', 'vkdmsaa', 'grvk']
+    
+    print(f"    Generating ratio columns for all version pairs...")
+    
+    for i, version1 in enumerate(all_versions):
+        for version2 in all_versions[i+1:]:  # Only generate each pair once
+            for backend in backends:
+                col1_name = f"{backend}_{version1}"
+                col2_name = f"{backend}_{version2}"
+                
+                if col1_name in column_names and col2_name in column_names:
+                    # Generate ratio in one direction: version1 vs version2
+                    ratio_col_name = f"{backend}_{version1}_vs_{version2}"
+                    comparison_data[ratio_col_name] = [f"FORMULA:{col1_name}/{col2_name}"] * len(benches)
+                    print(f"      Added: {ratio_col_name} = {col1_name}/{col2_name}")
+                else:
+                    if col1_name not in column_names:
+                        print(f"      Warning: Missing column {col1_name}")
+                    if col2_name not in column_names:
+                        print(f"      Warning: Missing column {col2_name}")
     
     # Add summary columns from existing comparison page if provided
     if summary_columns:
@@ -738,7 +878,8 @@ def write_dataframe_with_formulas(writer, sheet_name, df):
         if len(df) > 0:
             first_val = df[col_name].iloc[0]
             if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
-                formula_expr = first_val[8:]
+                # This is a formula column
+                formula_expr = first_val[8:]  # Remove 'FORMULA:' prefix
                 parts = formula_expr.split('/')
                 if len(parts) == 2:
                     num_col_name = parts[0]
@@ -748,6 +889,7 @@ def write_dataframe_with_formulas(writer, sheet_name, df):
                         num_col_letter = col_letters[num_col_name]
                         den_col_letter = col_letters[den_col_name]
                         
+                        # Add formula to each row
                         for row_idx in range(2, len(df) + 2):
                             formula = f"={num_col_letter}{row_idx}/{den_col_letter}{row_idx}"
                             cell = sheet.cell(row=row_idx, column=col_idx)
@@ -765,14 +907,19 @@ def apply_table_formatting_to_sheet(sheet, df):
     end_row = len(df) + 1
     end_col = len(df.columns)
     
+    # Create table range reference
     table_range = f"{get_column_letter(start_col)}{start_row}:{get_column_letter(end_col)}{end_row}"
+    
+    # Create table
     table_name = f"Table_{sheet.title.replace(' ', '_')[:20]}"
     
+    # Remove existing table if it exists
     for existing_table in list(sheet.tables.keys()):
         if existing_table.startswith("Table_"):
             del sheet.tables[existing_table]
     
     table = Table(displayName=table_name, ref=table_range)
+    
     style = TableStyleInfo(
         name="TableStyleMedium9",
         showFirstColumn=False,
@@ -781,8 +928,10 @@ def apply_table_formatting_to_sheet(sheet, df):
         showColumnStripes=False
     )
     table.tableStyleInfo = style
+    
     sheet.add_table(table)
     
+    # Auto-adjust column widths
     for column in sheet.columns:
         max_length = 0
         column_letter = column[0].column_letter
@@ -795,6 +944,7 @@ def apply_table_formatting_to_sheet(sheet, df):
         adjusted_width = min(max_length + 2, 60)
         sheet.column_dimensions[column_letter].width = adjusted_width
     
+    # Style header row
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
     for cell in sheet[1]:
@@ -802,6 +952,7 @@ def apply_table_formatting_to_sheet(sheet, df):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal='center', vertical='center')
     
+    # Freeze panes
     sheet.freeze_panes = sheet['B2']
 
 def backup_original_sheets(writer, all_original_sheets):
@@ -811,16 +962,23 @@ def backup_original_sheets(writer, all_original_sheets):
     print(f"\n📋 Backing up original backend pages...")
     
     for sheet_name, df in all_original_sheets.items():
+        # Clean sheet name (Excel has 31 char limit)
         clean_sheet_name = sheet_name[:31]
+        
+        # Check if sheet already exists and rename if needed
         final_sheet_name = clean_sheet_name
         counter = 1
         while final_sheet_name in workbook.sheetnames:
             final_sheet_name = f"{clean_sheet_name[:27]}_{counter}"
             counter += 1
         
+        # Write dataframe to sheet
         df.to_excel(writer, sheet_name=final_sheet_name, index=False)
+        
+        # Get the sheet and format it
         sheet = workbook[final_sheet_name]
         
+        # Auto-adjust column widths
         for column in sheet.columns:
             max_length = 0
             column_letter = column[0].column_letter
@@ -833,6 +991,7 @@ def backup_original_sheets(writer, all_original_sheets):
             adjusted_width = min(max_length + 2, 50)
             sheet.column_dimensions[column_letter].width = adjusted_width
         
+        # Style header
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         for cell in sheet[1]:
@@ -840,13 +999,15 @@ def backup_original_sheets(writer, all_original_sheets):
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal='center', vertical='center')
         
+        # Freeze header row
         sheet.freeze_panes = sheet['A2']
+        
         print(f"  ✓ Backed up '{sheet_name}' -> sheet '{final_sheet_name}' ({len(df)} rows)")
 
 def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
                   output_file, version_num, all_original_sheets, summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
-                  missing_backends, single_version_backends):
+                  missing_backends, single_version_backends, baseline_version, compare_versions):
     """Print a summary of the analysis."""
     print("\n" + "="*60)
     print("✅ Analysis complete!")
@@ -865,6 +1026,10 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_gro
     for version in version_groups.keys():
         num_backends = len(version_groups[version]['dataframes'])
         print(f"  - {version}: {num_backends} backends")
+    
+    print(f"\n🎯 Baseline version: {baseline_version}")
+    if compare_versions:
+        print(f"   Compare versions: {', '.join(compare_versions)}")
     
     # Print column/backend coverage summary
     if missing_backends:
@@ -897,14 +1062,15 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_gro
     print(f"   Version number: v{version_num}")
     
     print("\n📑 Sheets in output workbook:")
-    print("  - [version]_comparison (one per API version, filtered to common benchmarks)")
+    for version in compare_versions:
+        print(f"  - {version}_comparison (compare version page)")
     if len(version_groups) > 1:
-        print("  - cross_version_comparison (filtered to benchmarks common across ALL versions)")
+        print("  - cross_version_comparison (baseline + compare versions side-by-side)")
     print("  - backend_version (original data backups - unfiltered)")
     
     print("\n💡 Tips for using the Excel file:")
-    print("  1. Each version page only includes benchmarks that exist in ALL backends of that version")
-    print("  2. Cross-version page only includes benchmarks that exist in ALL backends of ALL versions")
+    print("  1. Compare version pages show benchmarks that exist in ALL backends of that version")
+    print("  2. Cross-version page shows baseline vs compare versions side-by-side")
     print("  3. Original backup sheets contain complete unfiltered data")
     print("  4. Use drop-down arrows in headers to sort/filter data")
     print("  5. First row and column are frozen for easy scrolling")
@@ -933,7 +1099,8 @@ def main():
     (all_dataframes, all_backends, version_info, version_groups, 
      all_original_sheets, summary_columns, missing_report, 
      unique_benchmarks, duplicate_report, missing_backends, 
-     single_version_backends, version_benchmarks) = read_multiple_excel_files(excel_files)
+     single_version_backends, version_benchmarks, baseline_version, 
+     compare_versions, comparison_type) = read_multiple_excel_files(excel_files)
     
     # Get unique benches for JSON analysis
     all_benches = set()
@@ -954,37 +1121,49 @@ def main():
     else:
         print("\n🔍 Skipping ftrace analysis - no folders provided")
     
-    # Generate output filename with version number
-    output_file, version_num = generate_output_filename(excel_files, folder_paths)
+    # Generate output filename with baseline version
+    output_file, version_num = generate_output_filename(baseline_version)
     
     # Write to Excel
     print(f"\n💾 Generating Excel workbook: {output_file} (version {version_num})")
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        # Create comparison page for each version
-        for version_name, version_data in version_groups.items():
-            print(f"\n  Creating comparison page for version: {version_name}")
-            missing_for_version = missing_report.get(version_name, set())
-            version_df = create_version_comparison_page(
-                version_data, version_name, folder_paths, draw_types_maps, 
-                summary_columns, missing_for_version, version_benchmarks
-            )
-            
-            if not version_df.empty:
-                sheet_name = f"{version_name}_comparison"[:31]
-                write_dataframe_with_formulas(writer, sheet_name, version_df)
-                
-                workbook = writer.book
-                sheet = workbook[sheet_name]
-                apply_table_formatting_to_sheet(sheet, version_df)
-                print(f"    ✓ Created '{sheet_name}' with {len(version_df)} benchmarks, {len(version_df.columns)} columns")
-            else:
-                print(f"    ✗ Skipping '{version_name}_comparison' - no common benchmarks found")
         
-        # Create cross-version comparison page if multiple versions
+        # Create comparison pages for each compare version
+        for compare_version in compare_versions:
+            # Find the full version that contains this compare version
+            full_version = None
+            for v in version_groups.keys():
+                if compare_version in v:
+                    full_version = v
+                    break
+            
+            if full_version and full_version in version_groups:
+                print(f"\n  Creating comparison page for version: {compare_version}")
+                version_data = version_groups[full_version]
+                missing_for_version = missing_report.get(full_version, set())
+                version_df = create_version_comparison_page(
+                    version_data, full_version, folder_paths, draw_types_maps, 
+                    summary_columns, missing_for_version, version_benchmarks,
+                    baseline_version, is_baseline=False
+                )
+                
+                if not version_df.empty:
+                    sheet_name = f"{compare_version}_comparison"[:31]
+                    write_dataframe_with_formulas(writer, sheet_name, version_df)
+                    
+                    workbook = writer.book
+                    sheet = workbook[sheet_name]
+                    apply_table_formatting_to_sheet(sheet, version_df)
+                    print(f"    ✓ Created '{sheet_name}' with {len(version_df)} benchmarks, {len(version_df.columns)} columns")
+                else:
+                    print(f"    ✗ Skipping '{compare_version}_comparison' - no common benchmarks found")
+        
+        # Create cross-version comparison page (contains baseline + compare versions)
         if len(version_groups) > 1:
             print(f"\n  Creating cross-version comparison page")
             cross_version_df = create_cross_version_page(
-                version_groups, all_backends, summary_columns, missing_report, version_benchmarks
+                version_groups, all_backends, summary_columns, missing_report, 
+                version_benchmarks, baseline_version, compare_versions, comparison_type
             )
             if cross_version_df is not None and not cross_version_df.empty:
                 write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df)
@@ -1003,7 +1182,7 @@ def main():
     print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
                   output_file, version_num, all_original_sheets, summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
-                  missing_backends, single_version_backends)
+                  missing_backends, single_version_backends, baseline_version, compare_versions)
     
     print("\n" + "="*60)
     print(f"Benchmark Analysis Tool v{VERSION} - Execution Complete")
