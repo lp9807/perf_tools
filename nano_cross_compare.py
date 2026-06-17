@@ -814,7 +814,7 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
     
     # Add ratio columns comparing all possible pairs of compare versions
     # Also include baseline version in the pairs
-    all_versions = [baseline_version] + compare_versions
+    all_versions = compare_versions
     backends = ['grdawn_vk', 'glesdmsaa', 'vkdmsaa', 'grvk']
     
     print(f"    Generating ratio columns for all version pairs...")

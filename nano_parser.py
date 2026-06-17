@@ -76,19 +76,81 @@ def detect_backend_type(folder_path):
     else:
         return 'ganesh'
 
+def sanitize_bench_name_for_file(bench_name):
+    """Remove dots from bench name for file lookup."""
+    # Remove all dots from the benchmark name
+    sanitized = bench_name.replace('.', '')
+    return sanitized
+
+def handle_duplicate_benchmarks(df, csv_file):
+    """Detect and handle duplicate benchmark names in a dataframe.
+    
+    Returns:
+        tuple: (processed_df, warning_messages)
+    """
+    warnings_list = []
+    
+    # Check for duplicates in 'bench' column
+    duplicate_benches = df[df['bench'].duplicated(keep=False)]
+    
+    if not duplicate_benches.empty:
+        file_name = Path(csv_file).name
+        print(f"\n⚠️  WARNING: Duplicate benchmark names found in {file_name}")
+        
+        # Get unique duplicate bench names and their counts
+        duplicate_counts = df['bench'].value_counts()
+        duplicates = duplicate_counts[duplicate_counts > 1]
+        
+        for bench_name, count in duplicates.items():
+            print(f"   - '{bench_name}' appears {count} times")
+            
+            # Get all rows for this duplicate benchmark
+            duplicate_rows = df[df['bench'] == bench_name]
+            warnings_list.append(f"Benchmark '{bench_name}' appears {count} times in {file_name}")
+            
+            # Show the mean values for each duplicate
+            for idx, row in duplicate_rows.iterrows():
+                print(f"     Row {idx + 2}: mean={row['mean']:.4f}" if 'mean' in row else f"     Row {idx + 2}: {row.to_dict()}")
+        
+        # Strategy: Keep the first occurrence and warn about others
+        print(f"\n   📌 Strategy: Keeping first occurrence, dropping {len(duplicate_benches) - len(duplicates)} duplicate rows")
+        df = df.drop_duplicates(subset=['bench'], keep='first')
+        
+    return df, warnings_list
+
 def read_csv_files(csv_files):
-    """Read CSV files and validate they contain 'bench' and 'mean' columns."""
+    """Read CSV files, validate columns, and detect duplicate benchmarks."""
     dataframes = {}
+    all_warnings = []
+    
     for csv_file in csv_files:
         try:
             df = pd.read_csv(csv_file)
+            
+            # Check required columns
             if 'bench' not in df.columns or 'mean' not in df.columns:
                 print(f"Error: CSV file '{csv_file}' must contain 'bench' and 'mean' columns")
                 sys.exit(1)
+            
+            # Check for and handle duplicate benchmarks
+            df, warnings = handle_duplicate_benchmarks(df, csv_file)
+            if warnings:
+                all_warnings.extend(warnings)
+            
             dataframes[csv_file] = df
+            
         except Exception as e:
             print(f"Error reading CSV file '{csv_file}': {e}")
             sys.exit(1)
+    
+    # Print summary of all duplicate warnings
+    if all_warnings:
+        print("\n" + "="*60)
+        print("📋 DUPLICATE BENCHMARK SUMMARY:")
+        for warning in all_warnings:
+            print(f"  • {warning}")
+        print("="*60 + "\n")
+    
     return dataframes
 
 def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
@@ -102,7 +164,14 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     flush_pattern = re.compile(r'GrDrawingManager::flush')
     
     for bench in benches:
-        json_file = folder / f"{bench}.json"
+        # Sanitize bench name by removing dots for file lookup
+        sanitized_bench = sanitize_bench_name_for_file(bench)
+        json_file = folder / f"{sanitized_bench}.json"
+        
+        # Also try original name if sanitized version doesn't exist
+        if not json_file.exists():
+            json_file = folder / f"{bench}.json"
+        
         draw_counts = {}
         flush_count = 0
         
@@ -155,7 +224,11 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
             except Exception as e:
                 draw_types_map[bench] = f"Error parsing JSON: {str(e)[:50]}"
         else:
-            draw_types_map[bench] = f"JSON file not found: {json_file}"
+            # Check if we tried sanitized version but original might have existed
+            if sanitized_bench != bench:
+                draw_types_map[bench] = f"JSON file not found (tried: {sanitized_bench}.json and {bench}.json)"
+            else:
+                draw_types_map[bench] = f"JSON file not found: {json_file}"
     
     return draw_types_map
 
@@ -165,13 +238,22 @@ def analyze_ftrace_files_graphite(folder_path, benches):
     draw_types_map = {}
     
     for bench in benches:
-        json_file = folder / f"{bench}.json"
+        # Sanitize bench name by removing dots for file lookup
+        sanitized_bench = sanitize_bench_name_for_file(bench)
+        json_file = folder / f"{sanitized_bench}.json"
+        
+        # Also try original name if sanitized version doesn't exist
+        if not json_file.exists():
+            json_file = folder / f"{bench}.json"
         
         if json_file.exists():
             # TODO: Implement Graphite-specific trace analysis
             draw_types_map[bench] = "TODO: Graphite trace analysis not yet implemented"
         else:
-            draw_types_map[bench] = f"JSON file not found: {json_file}"
+            if sanitized_bench != bench:
+                draw_types_map[bench] = f"JSON file not found (tried: {sanitized_bench}.json and {bench}.json)"
+            else:
+                draw_types_map[bench] = f"JSON file not found: {json_file}"
     
     return draw_types_map
 
@@ -199,6 +281,68 @@ def analyze_ftrace_files(folder_path, benches, folder_exists, folder_name):
     else:  # ganesh
         return analyze_ftrace_files_ganesh(folder_path, benches, folder_name)
 
+def validate_and_filter_backends(dataframes, ratio_configs):
+    """Validate that required backend columns exist for ratio calculations.
+    Reports missing columns and filters out invalid ratio configs.
+    
+    Returns:
+        tuple: (filtered_ratio_configs, missing_backends_report)
+    """
+    available_backends = [Path(csv_file).stem.lower() for csv_file in dataframes.keys()]
+    print("\n🔍 Checking backend availability for ratio calculations:")
+    print(f"   Available backends: {', '.join(available_backends)}")
+    
+    missing_report = []
+    valid_configs = []
+    
+    for config in ratio_configs:
+        ratio_name = config['name']
+        numerator_found = False
+        denominator_found = False
+        found_numerator = None
+        found_denominator = None
+        
+        # Check numerator
+        for pattern in config['numerator_patterns']:
+            for backend in available_backends:
+                if pattern in backend:
+                    numerator_found = True
+                    found_numerator = backend
+                    break
+            if numerator_found:
+                break
+        
+        # Check denominator
+        for pattern in config['denominator_patterns']:
+            for backend in available_backends:
+                if pattern in backend:
+                    denominator_found = True
+                    found_denominator = backend
+                    break
+            if denominator_found:
+                break
+        
+        if numerator_found and denominator_found:
+            valid_configs.append(config)
+            print(f"   ✅ {ratio_name}: {found_numerator} / {found_denominator}")
+        else:
+            missing_parts = []
+            if not numerator_found:
+                missing_parts.append(f"numerator (patterns: {config['numerator_patterns']})")
+            if not denominator_found:
+                missing_parts.append(f"denominator (patterns: {config['denominator_patterns']})")
+            
+            missing_msg = f"   ❌ {ratio_name} - missing {', '.join(missing_parts)}"
+            print(missing_msg)
+            missing_report.append(f"Ratio '{ratio_name}' skipped: missing {', '.join(missing_parts)}")
+    
+    if missing_report:
+        print("\n⚠️  Some ratio columns will not be added due to missing backends")
+        for report in missing_report:
+            print(f"   {report}")
+    
+    return valid_configs, missing_report
+
 def find_common_benches(dataframes):
     """Find benches that exist in ALL CSV files and report missing ones."""
     # Get sets of benches from each CSV
@@ -218,15 +362,32 @@ def find_common_benches(dataframes):
     
     # Check each file for missing benchmarks
     all_benches_union = set.union(*bench_sets)
+    
+    # Track duplicates across files (benchmark names that appear multiple times in same file)
+    duplicate_across_files = {}
+    for csv_file, df in dataframes.items():
+        dup_in_file = df[df['bench'].duplicated(keep=False)]['bench'].tolist()
+        if dup_in_file:
+            duplicate_across_files[Path(csv_file).name] = set(dup_in_file)
+    
+    if duplicate_across_files:
+        print("\n⚠️  DUPLICATE BENCHMARKS DETECTED ACROSS FILES:")
+        for file_name, benches in duplicate_across_files.items():
+            print(f"  • {file_name}: {', '.join(benches)} (appears multiple times - handled by keeping first)")
+    
+    # Report missing benchmarks per file
+    missing_benchmarks_report = []
     for bench in sorted(all_benches_union):
         if bench not in common_benches:
             missing_in = []
             for csv_file, bench_set in zip(dataframes.keys(), bench_sets):
                 if bench not in bench_set:
                     missing_in.append(Path(csv_file).name)
-            print(f"  ⚠️  '{bench}' - missing in: {', '.join(missing_in)}")
+            missing_msg = f"  ⚠️  '{bench}' - missing in: {', '.join(missing_in)}"
+            print(missing_msg)
+            missing_benchmarks_report.append(missing_msg)
     
-    return common_benches
+    return common_benches, missing_benchmarks_report
 
 def create_comparison_page(dataframes, draw_types_maps, folder_paths, common_benches):
     """Create the comparison dataframe with summary columns for each folder.
@@ -252,7 +413,7 @@ def create_comparison_page(dataframes, draw_types_maps, folder_paths, common_ben
     # Add mean columns for each CSV (named after filename/backend)
     for csv_file, df in dataframes.items():
         backend_name = Path(csv_file).stem  # Remove .csv extension
-        # Create dictionary only for common benches
+        # Create dictionary only for common benches (first occurrence if duplicates existed)
         mean_dict = dict(zip(df['bench'], df['mean']))
         comparison_data[backend_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
     
@@ -278,29 +439,10 @@ def create_comparison_page(dataframes, draw_types_maps, folder_paths, common_ben
     
     return comparison_df
 
-def add_excel_ratio_formulas(writer, comparison_df, dataframes):
-    """Add Excel formulas for all ratio columns."""
+def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_configs):
+    """Add Excel formulas for valid ratio columns only."""
     workbook = writer.book
     sheet = workbook['comparison']
-    
-    # Define ratio configurations
-    ratio_configs = [
-        {
-            'name': 'grdawn_vk vs glesdmsaa',
-            'numerator_patterns': ['grdawn_vk', 'grdawn-vk', 'grdawnvk'],
-            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
-        },
-        {
-            'name': 'vkdmsaa vs glesdmsaa',
-            'numerator_patterns': ['vkdmsaa', 'vk-dmsaa', 'vkdmsaa'],
-            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
-        },
-        {
-            'name': 'grvk vs glesdmsaa',
-            'numerator_patterns': ['grvk', 'gr-vk', 'grvk'],
-            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
-        }
-    ]
     
     # Get all headers
     headers = [cell.value for cell in sheet[1]]
@@ -312,8 +454,9 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes):
             header_lower = header.lower()
             column_map[header_lower] = col_idx
     
-    # Process each ratio configuration
-    for config in ratio_configs:
+    # Process each valid ratio configuration
+    added_ratios = []
+    for config in valid_ratio_configs:
         ratio_name = config['name']
         
         # Find numerator column
@@ -341,11 +484,7 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes):
                 break
         
         if not numerator_col or not denominator_col:
-            print(f"\n⚠️  Warning: Could not find columns for ratio '{ratio_name}'")
-            if not numerator_col:
-                print(f"  - Numerator not found (patterns: {config['numerator_patterns']})")
-            if not denominator_col:
-                print(f"  - Denominator not found (patterns: {config['denominator_patterns']})")
+            print(f"\n⚠️  Warning: Could not find columns for ratio '{ratio_name}' (should have been filtered)")
             continue
         
         # Check if ratio column already exists
@@ -391,6 +530,9 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes):
         print(f"  - Added formula to {formula_count} rows")
         print(f"  - Column: {column_letter}")
         print(f"  - Example formula: {formula}")
+        added_ratios.append(ratio_name)
+    
+    return added_ratios
 
 def apply_table_formatting(writer, comparison_df):
     """Apply Excel table formatting to the comparison sheet for sorting/filtering."""
@@ -440,9 +582,17 @@ def apply_table_formatting(writer, comparison_df):
     
     return table
 
-def format_excel_workbook(writer, comparison_df, dataframes, folder_paths):
+def format_excel_workbook(writer, comparison_df, dataframes, folder_paths, missing_backends_report):
     """Format the Excel workbook with styling."""
     workbook = writer.book
+    
+    # Add missing backends information to comparison sheet
+    if missing_backends_report:
+        comparison_sheet = workbook['comparison']
+        # Add a comment to cell A1 about missing backends
+        missing_text = "⚠️ Missing Backends for Ratio Columns:\n\n" + "\n".join(missing_backends_report)
+        comment = Comment(missing_text, "Data Processor")
+        comparison_sheet['A1'].comment = comment
     
     # Format comparison sheet
     comparison_sheet = workbook['comparison']
@@ -499,7 +649,7 @@ def format_excel_workbook(writer, comparison_df, dataframes, folder_paths):
             # Freeze header row for CSV sheets too
             sheet.freeze_panes = sheet['A2']
 
-def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, ratio_columns):
+def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, added_ratios, missing_benchmarks_report, missing_backends_report):
     """Print a summary of the analysis."""
     print("\n" + "="*60)
     print("✅ Analysis complete!")
@@ -521,12 +671,32 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes,
             print(f"     Benchmarks with trace info: {benches_with_info}/{total_benches}")
     
     print(f"\n📊 CSV files processed: {len(dataframes)}")
-    for csv_file in dataframes.keys():
-        print(f"  - {Path(csv_file).name}: {len(dataframes[csv_file])} rows")
+    for csv_file, df in dataframes.items():
+        print(f"  - {Path(csv_file).name}: {len(df)} rows")
     
     print(f"\n📈 Comparison page: {len(comparison_df)} benchmarks (common across all files)")
     print(f"   Base columns: ID, Bench, backend columns ({len(dataframes)}), summary columns ({len(folder_paths)})")
-    print(f"   Ratio columns added: {len(ratio_columns)} ({', '.join(ratio_columns)})")
+    print(f"   Ratio columns added: {len(added_ratios)} ({', '.join(added_ratios) if added_ratios else 'None'})")
+    
+    # Report missing benchmarks
+    if missing_benchmarks_report:
+        print(f"\n⚠️  MISSING BENCHMARKS ({len(missing_benchmarks_report)}):")
+        for report in missing_benchmarks_report[:10]:  # Show first 10
+            print(f"  {report}")
+        if len(missing_benchmarks_report) > 10:
+            print(f"  ... and {len(missing_benchmarks_report) - 10} more")
+    
+    # Report missing backends
+    if missing_backends_report:
+        print(f"\n⚠️  MISSING BACKENDS FOR RATIO CALCULATIONS ({len(missing_backends_report)}):")
+        for report in missing_backends_report:
+            print(f"  {report}")
+    
+    # Note about JSON file lookup
+    print("\n📁 JSON File Lookup:")
+    print("  - Dots (.) are automatically removed from benchmark names when locating JSON files")
+    print("  - The script tries sanitized name first, then original name")
+    print("  - Example: 'bench.test.1' -> looks for 'benchestest1.json', then 'bench.test.1.json'")
     
     # Note about table features
     print("\n📊 Excel Table Features Available:")
@@ -535,10 +705,19 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes,
     print("  - Header row frozen for scrolling")
     print("  - Resizable and customizable table style")
     
+    # Note about duplicate handling
+    print("\n⚠️  Duplicate Benchmark Handling:")
+    print("  - Duplicate benchmark names in CSV files are detected and reported in console output")
+    print("  - Only the first occurrence of each duplicate is used in comparisons")
+    print("  - No error messages are written to Excel sheets")
+    
     # Note about ratio formulas
-    print("\n📐 Ratio Columns (Excel Formulas):")
-    for ratio_col in ratio_columns:
-        print(f"  - {ratio_col}: Calculated dynamically when Excel file is opened")
+    if added_ratios:
+        print("\n📐 Ratio Columns Added (Excel Formulas):")
+        for ratio_col in added_ratios:
+            print(f"  - {ratio_col}: Calculated dynamically when Excel file is opened")
+    else:
+        print("\n⚠️  No ratio columns were added due to missing backend requirements")
 
 def main():
     """Main function to orchestrate the script."""
@@ -556,13 +735,35 @@ def main():
     for csv_file in csv_files:
         print(f"  - {csv_file}")
     
-    # Read CSV files
-    print("\n📖 Reading CSV files...")
+    # Read CSV files (with duplicate detection)
+    print("\n📖 Reading CSV files and checking for duplicates...")
     dataframes = read_csv_files(csv_files)
+    
+    # Define ratio configurations
+    ratio_configs = [
+        {
+            'name': 'grdawn_vk vs glesdmsaa',
+            'numerator_patterns': ['grdawn_vk', 'grdawn-vk', 'grdawnvk'],
+            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
+        },
+        {
+            'name': 'vkdmsaa vs glesdmsaa',
+            'numerator_patterns': ['vkdmsaa', 'vk-dmsaa', 'vkdmsaa'],
+            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
+        },
+        {
+            'name': 'grvk vs grdawn_vk',
+            'numerator_patterns': ['grvk', 'gr-vk', 'grvk'],
+            'denominator_patterns': ['grdawn_vk', 'grdawn-vk', 'grdawnvk']
+        }
+    ]
+    
+    # Validate backends and filter ratio configs
+    valid_ratio_configs, missing_backends_report = validate_and_filter_backends(dataframes, ratio_configs)
     
     # Find common benches across all CSV files and report missing ones
     print("\n🔍 Finding common benchmarks across all CSV files...")
-    common_benches = find_common_benches(dataframes)
+    common_benches, missing_benchmarks_report = find_common_benches(dataframes)
     
     # Analyze ftrace JSON files for each folder (only for common benches)
     print("\n🔍 Analyzing ftrace JSON files...")
@@ -592,17 +793,15 @@ def main():
             sheet_name = Path(csv_file).stem[:31]  # Excel sheet name max 31 chars
             df.to_excel(writer, sheet_name=sheet_name, index=False)
         
-        # Add Excel formulas for ratio columns
-        add_excel_ratio_formulas(writer, comparison_df, dataframes)
+        # Add Excel formulas for valid ratio columns only
+        added_ratios = add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_configs)
         
         # Apply formatting (including table formatting)
-        format_excel_workbook(writer, comparison_df, dataframes, folder_paths)
-    
-    # Define ratio columns for summary
-    ratio_columns = ['grdawn_vk vs glesdmsaa', 'vkdmsaa vs glesdmsaa', 'grvk vs grdawn_vk']
+        format_excel_workbook(writer, comparison_df, dataframes, folder_paths, missing_backends_report)
     
     # Print summary
-    print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, ratio_columns)
+    print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, 
+                 added_ratios, missing_benchmarks_report, missing_backends_report)
     
     # Show sample of the comparison table structure (only for non-formula columns)
     print("\n📋 Sample of comparison table structure (first 5 rows, values from CSV data only):")
@@ -635,8 +834,8 @@ def main():
     print(f"  - Summary columns: {len(summary_cols)}")
     for col in summary_cols:
         print(f"    * {col}")
-    print(f"  - Ratio columns: {len(ratio_columns)} (Excel formulas)")
-    for col in ratio_columns:
+    print(f"  - Ratio columns: {len(added_ratios)} (Excel formulas)")
+    for col in added_ratios:
         print(f"    * {col}")
     
     print("\n💡 Tips for using the Excel file:")
@@ -647,6 +846,8 @@ def main():
     print("  5. All formulas recalculate when source data changes")
     print("  6. Summary columns show trace analysis results (draw types per flush)")
     print("  7. Individual CSV sheets contain ALL original data, comparison sheet only shows common benchmarks")
+    print("  8. Dots in benchmark names are removed when locating JSON files (e.g., 'test.bench' -> 'testbench.json')")
+    print("  9. Duplicate benchmark warnings are shown in console output only, not in Excel sheets")
     
     print("\n" + "="*60)
 
