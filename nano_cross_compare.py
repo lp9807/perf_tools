@@ -704,18 +704,44 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
         comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
         backend_columns[display_name] = display_name
     
-    # Add ratio columns for this version using baseline version (store as formula placeholders)
-    # Use baseline_version for ratio calculations
+    print(f"    Backend columns found: {', '.join(backend_columns.keys())}")
+    
+    # Add ratio and diff columns for this version (store as formula placeholders)
+    # Each config generates 2 columns: ratio (division) and diff (subtraction)
     ratio_configs = [
         ('grdawn_vk vs glesdmsaa', 'grdawn_vk', 'glesdmsaa'),
         ('vkdmsaa vs glesdmsaa', 'vkdmsaa', 'glesdmsaa'),
-        ('grvk vs glesdmsaa', 'grvk', 'glesdmsaa')
+        ('grvk vs glesdmsaa', 'grvk', 'glesdmsaa'),
+        ('grvk vs vkdmsaa', 'grvk', 'vkdmsaa')
     ]
     
-    for ratio_name, num_backend, den_backend in ratio_configs:
+    ratio_columns = []
+    for config_name, num_backend, den_backend in ratio_configs:
+        print(f"    Processing config: {config_name}")
+        print(f"      Numerator: {num_backend}, Denominator: {den_backend}")
+        
         if num_backend in backend_columns and den_backend in backend_columns:
-            # Store as formula placeholder
-            comparison_data[ratio_name] = [f"FORMULA:{num_backend}/{den_backend}"] * len(benches)
+            print(f"      ✓ Both backends found in data")
+            
+            # Ratio column (division)
+            ratio_col_name = f"{config_name} (ratio)"
+            comparison_data[ratio_col_name] = [f"FORMULA:{num_backend}/{den_backend}"] * len(benches)
+            ratio_columns.append(ratio_col_name)
+            print(f"      ✓ Added ratio column: '{ratio_col_name}' = {num_backend}/{den_backend}")
+            
+            # Diff column (subtraction)
+            diff_col_name = f"{config_name} (diff)"
+            comparison_data[diff_col_name] = [f"FORMULA:{num_backend}-{den_backend}"] * len(benches)
+            ratio_columns.append(diff_col_name)
+            print(f"      ✓ Added diff column: '{diff_col_name}' = {num_backend}-{den_backend}")
+        else:
+            print(f"      ✗ WARNING: Backends not found for {config_name}")
+            if num_backend not in backend_columns:
+                print(f"        Missing numerator: {num_backend}")
+            if den_backend not in backend_columns:
+                print(f"        Missing denominator: {den_backend}")
+    
+    print(f"    Total columns added: {len(ratio_columns)} (ratio + diff)")
     
     # Add summary columns from existing comparison page if provided
     if summary_columns:
@@ -731,7 +757,42 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
                 summary_col_name = f"trace_summary_of_{folder_name}"
                 comparison_data[summary_col_name] = [draw_types_maps[idx].get(bench, "No trace data") for bench in benches]
     
-    return pd.DataFrame(comparison_data)
+    # Create DataFrame
+    df = pd.DataFrame(comparison_data)
+    
+    # Add average row at the end
+    if len(df) > 0:
+        # Create a new row with 'AVERAGE' in the Bench column
+        avg_row = {'ID': '', 'Bench': 'AVERAGE'}
+        
+        # Calculate average for each column (excluding non-numeric columns)
+        for col in df.columns:
+            if col not in ['ID', 'Bench']:
+                # Try to convert to numeric, if fails, leave as empty string
+                try:
+                    # Check if column contains formula placeholders
+                    if df[col].dtype == 'object' and len(df) > 0:
+                        first_val = df[col].iloc[0]
+                        if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
+                            # For formula columns, skip average (formulas can't be averaged as strings)
+                            avg_row[col] = ''
+                            continue
+                    
+                    # Convert column to numeric, coercing errors to NaN
+                    numeric_values = pd.to_numeric(df[col], errors='coerce')
+                    if not numeric_values.isna().all():
+                        # Calculate mean, ignoring NaN
+                        avg_value = numeric_values.mean()
+                        avg_row[col] = avg_value
+                    else:
+                        avg_row[col] = ''
+                except:
+                    avg_row[col] = ''
+        
+        # Append the average row to the DataFrame
+        df = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
+    
+    return df
 
 def create_cross_version_page(version_groups, all_backends, summary_columns, missing_report, 
                                version_benchmarks, baseline_version, compare_versions, comparison_type):
@@ -812,21 +873,21 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
             comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
             column_names[display_name] = display_name
     
-    # Add ratio columns comparing all possible pairs of compare versions
-    # Also include baseline version in the pairs
-    all_versions = compare_versions
+    # Add ratio columns comparing ALL possible pairs of compare versions
+    # Only compare between compare_versions, NOT including baseline
     backends = ['grdawn_vk', 'glesdmsaa', 'vkdmsaa', 'grvk']
     
-    print(f"    Generating ratio columns for all version pairs...")
+    print(f"    Generating ratio columns for all compare version pairs...")
     
-    for i, version1 in enumerate(all_versions):
-        for version2 in all_versions[i+1:]:  # Only generate each pair once
+    # Generate pairs only from compare_versions (exclude baseline)
+    for i, version1 in enumerate(compare_versions):
+        for version2 in compare_versions[i+1:]:
             for backend in backends:
                 col1_name = f"{backend}_{version1}"
                 col2_name = f"{backend}_{version2}"
                 
                 if col1_name in column_names and col2_name in column_names:
-                    # Generate ratio in one direction: version1 vs version2
+                    # Generate ratio: version1 vs version2
                     ratio_col_name = f"{backend}_{version1}_vs_{version2}"
                     comparison_data[ratio_col_name] = [f"FORMULA:{col1_name}/{col2_name}"] * len(benches)
                     print(f"      Added: {ratio_col_name} = {col1_name}/{col2_name}")
@@ -842,13 +903,60 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
             if len(col_values) == len(benches):
                 comparison_data[col_name] = col_values
     
-    return pd.DataFrame(comparison_data)
+    # Create DataFrame
+    df = pd.DataFrame(comparison_data)
+    
+    # Add average row at the end (same as version comparison)
+    if len(df) > 0:
+        # Create a new row with 'AVERAGE' in the Bench column
+        avg_row = {'ID': '', 'Bench': 'AVERAGE'}
+        
+        # Calculate average for each column (excluding non-numeric columns)
+        for col in df.columns:
+            if col not in ['ID', 'Bench']:
+                # Try to convert to numeric, if fails, leave as empty string
+                try:
+                    # Check if column contains formula placeholders
+                    if df[col].dtype == 'object' and len(df) > 0:
+                        first_val = df[col].iloc[0]
+                        if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
+                            # For formula columns, skip average (formulas can't be averaged as strings)
+                            avg_row[col] = ''
+                            continue
+                    
+                    # Convert column to numeric, coercing errors to NaN
+                    numeric_values = pd.to_numeric(df[col], errors='coerce')
+                    if not numeric_values.isna().all():
+                        # Calculate mean, ignoring NaN
+                        avg_value = numeric_values.mean()
+                        avg_row[col] = avg_value
+                    else:
+                        avg_row[col] = ''
+                except:
+                    avg_row[col] = ''
+        
+        # Append the average row to the DataFrame
+        df = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
+    
+    return df
 
-def write_dataframe_with_formulas(writer, sheet_name, df):
-    """Write dataframe to Excel with proper Excel formulas."""
+def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
+    """Write dataframe to Excel with proper Excel formulas, average row outside table."""
     if df.empty:
         print(f"    WARNING: DataFrame for '{sheet_name}' is empty, skipping")
         return
+    
+    # Check if we have an average row
+    has_average = False
+    avg_data = None
+    
+    if add_average_row and len(df) > 0 and 'Bench' in df.columns:
+        if df.iloc[-1]['Bench'] == 'AVERAGE':
+            has_average = True
+            # Extract the average row data
+            avg_data = df.iloc[-1].to_dict()
+            # Remove the average row from the dataframe
+            df = df.iloc[:-1]
     
     # First write the dataframe values without formulas
     df_for_write = df.copy()
@@ -873,38 +981,122 @@ def write_dataframe_with_formulas(writer, sheet_name, df):
     for idx, col_name in enumerate(df.columns, 1):
         col_letters[col_name] = get_column_letter(idx)
     
+    # The last data row (excluding average row)
+    last_data_row = len(df) + 1  # +1 for header
+    
+    # Track which columns are formula columns
+    formula_columns = {}
+    
     # Add formulas to each column
     for col_idx, col_name in enumerate(df.columns, 1):
         if len(df) > 0:
+            # Check if this is a formula column
             first_val = df[col_name].iloc[0]
             if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
                 # This is a formula column
+                formula_columns[col_name] = True
                 formula_expr = first_val[8:]  # Remove 'FORMULA:' prefix
-                parts = formula_expr.split('/')
-                if len(parts) == 2:
-                    num_col_name = parts[0]
-                    den_col_name = parts[1]
-                    
-                    if num_col_name in col_letters and den_col_name in col_letters:
-                        num_col_letter = col_letters[num_col_name]
-                        den_col_letter = col_letters[den_col_name]
+                
+                if '/' in formula_expr:
+                    # Division formula
+                    parts = formula_expr.split('/')
+                    if len(parts) == 2:
+                        num_col_name = parts[0]
+                        den_col_name = parts[1]
                         
-                        # Add formula to each row
-                        for row_idx in range(2, len(df) + 2):
-                            formula = f"={num_col_letter}{row_idx}/{den_col_letter}{row_idx}"
-                            cell = sheet.cell(row=row_idx, column=col_idx)
-                            cell.value = formula
-                            cell.number_format = "0.000"
-                            cell.comment = Comment(f"Formula: {num_col_name} / {den_col_name}", "Script")
+                        if num_col_name in col_letters and den_col_name in col_letters:
+                            num_col_letter = col_letters[num_col_name]
+                            den_col_letter = col_letters[den_col_name]
+                            
+                            for row_idx in range(2, last_data_row + 1):
+                                formula = f"={num_col_letter}{row_idx}/{den_col_letter}{row_idx}"
+                                cell = sheet.cell(row=row_idx, column=col_idx)
+                                cell.value = formula
+                                cell.number_format = "0.000"
+                elif '-' in formula_expr:
+                    # Subtraction formula
+                    parts = formula_expr.split('-')
+                    if len(parts) == 2:
+                        num_col_name = parts[0]
+                        den_col_name = parts[1]
+                        
+                        if num_col_name in col_letters and den_col_name in col_letters:
+                            num_col_letter = col_letters[num_col_name]
+                            den_col_letter = col_letters[den_col_name]
+                            
+                            for row_idx in range(2, last_data_row + 1):
+                                formula = f"={num_col_letter}{row_idx}-{den_col_letter}{row_idx}"
+                                cell = sheet.cell(row=row_idx, column=col_idx)
+                                cell.value = formula
+                                cell.number_format = "0.000"
+    
+    # Add average row below the table (if it exists)
+    if has_average and avg_data:
+        avg_row_excel = last_data_row + 2  # Leave one empty row after table
+        
+        # Add AVERAGE label
+        for idx, col_name in enumerate(df.columns, 1):
+            if col_name == 'Bench':
+                cell = sheet.cell(row=avg_row_excel, column=idx)
+                cell.value = "AVERAGE"
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            elif col_name not in ['ID']:
+                # Check if this column should have an average:
+                # 1. It's a formula column (will evaluate to number)
+                # 2. It's a numeric column
+                should_have_average = False
+                
+                if col_name in formula_columns:
+                    # Formula column - will evaluate to number
+                    should_have_average = True
+                else:
+                    # Check if it's a numeric column by looking at the actual data
+                    # (excluding formula placeholders)
+                    for check_row in range(2, min(last_data_row + 1, 10)):  # Check first few rows
+                        cell_value = sheet.cell(row=check_row, column=idx).value
+                        if cell_value is not None and isinstance(cell_value, (int, float)):
+                            should_have_average = True
+                            break
+                        elif cell_value is not None and isinstance(cell_value, str):
+                            # Check if string represents a number
+                            try:
+                                float(cell_value)
+                                should_have_average = True
+                                break
+                            except:
+                                pass
+                
+                if should_have_average:
+                    # Add AVERAGE formula for numeric/formula columns
+                    col_letter = get_column_letter(idx)
+                    avg_formula = f"=AVERAGE({col_letter}2:{col_letter}{last_data_row + 1})"
+                    cell = sheet.cell(row=avg_row_excel, column=idx)
+                    cell.value = avg_formula
+                    cell.number_format = "0.000"
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                else:
+                    # Non-numeric column - leave empty
+                    cell = sheet.cell(row=avg_row_excel, column=idx)
+                    cell.value = ""
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        print(f"    ✓ Added average row at row {avg_row_excel} (outside table)")
+    
+    return df  # Return the modified dataframe (without average row)
 
 def apply_table_formatting_to_sheet(sheet, df):
     """Apply Excel table formatting to a sheet."""
-    if df.empty:
-        return
     
+    # Determine the range of the table (exclude average row)
     start_row = 1
     start_col = 1
-    end_row = len(df) + 1
+    end_row = len(df) + 1  # +1 for header
     end_col = len(df.columns)
     
     # Create table range reference
@@ -954,6 +1146,10 @@ def apply_table_formatting_to_sheet(sheet, df):
     
     # Freeze panes
     sheet.freeze_panes = sheet['B2']
+    
+    print(f"    ✓ Applied table formatting to range: {table_range}")
+    
+    return table
 
 def backup_original_sheets(writer, all_original_sheets):
     """Backup original backend sheets into the output workbook."""
