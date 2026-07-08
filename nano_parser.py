@@ -44,10 +44,6 @@ def validate_arguments():
             print(f"Error: Maximum 2 folder parameters allowed. Extra parameter: '{arg}'")
             sys.exit(1)
     
-    if len(folder_paths) == 0:
-        print("Error: At least one folder path must be provided")
-        sys.exit(1)
-    
     if len(csv_files) == 0:
         print("Error: At least one CSV file must be provided")
         sys.exit(1)
@@ -281,6 +277,79 @@ def analyze_ftrace_files(folder_path, benches, folder_exists, folder_name):
     else:  # ganesh
         return analyze_ftrace_files_ganesh(folder_path, benches, folder_name)
 
+def generate_ratio_configs(dataframes):
+    """Generate ratio configurations dynamically based on available backends.
+    
+    Creates:
+    1. Pairs of any backend vs glesdmsaa (ratio and diff)
+    2. Pairs of any backend starting with 'gr' vs grdawn_vk (ratio and diff)
+    
+    Returns:
+        List of ratio configurations
+    """
+    # Get all backend names (stem of CSV files)
+    backends = [Path(csv_file).stem for csv_file in dataframes.keys()]
+    
+    # Find glesdmsaa backend
+    glesdmsaa_backend = None
+    for backend in backends:
+        if 'glesdmsaa' in backend.lower() or 'gles-dmsaa' in backend.lower():
+            glesdmsaa_backend = backend
+            break
+    
+    # Find grdawn_vk backend
+    grdawn_vk_backend = None
+    for backend in backends:
+        if 'grdawn_vk' in backend.lower() or 'grdawn-vk' in backend.lower() or 'grdawnvk' in backend.lower():
+            grdawn_vk_backend = backend
+            break
+    
+    ratio_configs = []
+    
+    # Generate pairs vs glesdmsaa (for all backends except glesdmsaa itself)
+    if glesdmsaa_backend:
+        for backend in backends:
+            if backend != glesdmsaa_backend:
+                # Ratio: backend / glesdmsaa
+                ratio_configs.append({
+                    'name': f'{backend} vs {glesdmsaa_backend} (ratio)',
+                    'numerator_patterns': [backend.lower()],
+                    'denominator_patterns': [glesdmsaa_backend.lower()],
+                    'type': 'ratio'
+                })
+                # Diff: backend - glesdmsaa
+                ratio_configs.append({
+                    'name': f'{backend} vs {glesdmsaa_backend} (diff)',
+                    'numerator_patterns': [backend.lower()],
+                    'denominator_patterns': [glesdmsaa_backend.lower()],
+                    'type': 'diff'
+                })
+    else:
+        print("\n⚠️  Warning: 'glesdmsaa' backend not found - skipping vs glesdmsaa comparisons")
+    
+    # Generate pairs vs grdawn_vk (for all backends starting with 'gr' except grdawn_vk itself)
+    if grdawn_vk_backend:
+        for backend in backends:
+            if backend != grdawn_vk_backend and backend.lower().startswith('gr'):
+                # Ratio: backend / grdawn_vk
+                ratio_configs.append({
+                    'name': f'{backend} vs {grdawn_vk_backend} (ratio)',
+                    'numerator_patterns': [backend.lower()],
+                    'denominator_patterns': [grdawn_vk_backend.lower()],
+                    'type': 'ratio'
+                })
+                # Diff: backend - grdawn_vk
+                ratio_configs.append({
+                    'name': f'{backend} vs {grdawn_vk_backend} (diff)',
+                    'numerator_patterns': [backend.lower()],
+                    'denominator_patterns': [grdawn_vk_backend.lower()],
+                    'type': 'diff'
+                })
+    else:
+        print("\n⚠️  Warning: 'grdawn_vk' backend not found - skipping vs grdawn_vk comparisons")
+    
+    return ratio_configs, glesdmsaa_backend, grdawn_vk_backend
+
 def validate_and_filter_backends(dataframes, ratio_configs):
     """Validate that required backend columns exist for ratio calculations.
     Reports missing columns and filters out invalid ratio configs.
@@ -324,7 +393,8 @@ def validate_and_filter_backends(dataframes, ratio_configs):
         
         if numerator_found and denominator_found:
             valid_configs.append(config)
-            print(f"   ✅ {ratio_name}: {found_numerator} / {found_denominator}")
+            calc_type = config.get('type', 'ratio')
+            print(f"   ✅ {ratio_name}: {found_numerator} / {found_denominator} ({calc_type})")
         else:
             missing_parts = []
             if not numerator_found:
@@ -334,7 +404,7 @@ def validate_and_filter_backends(dataframes, ratio_configs):
             
             missing_msg = f"   ❌ {ratio_name} - missing {', '.join(missing_parts)}"
             print(missing_msg)
-            missing_report.append(f"Ratio '{ratio_name}' skipped: missing {', '.join(missing_parts)}")
+            missing_report.append(f"'{ratio_name}' skipped: missing {', '.join(missing_parts)}")
     
     if missing_report:
         print("\n⚠️  Some ratio columns will not be added due to missing backends")
@@ -458,6 +528,7 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_conf
     added_ratios = []
     for config in valid_ratio_configs:
         ratio_name = config['name']
+        calc_type = config.get('type', 'ratio')
         
         # Find numerator column
         numerator_col = None
@@ -484,7 +555,7 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_conf
                 break
         
         if not numerator_col or not denominator_col:
-            print(f"\n⚠️  Warning: Could not find columns for ratio '{ratio_name}' (should have been filtered)")
+            print(f"\n⚠️  Warning: Could not find columns for '{ratio_name}' (should have been filtered)")
             continue
         
         # Check if ratio column already exists
@@ -506,21 +577,32 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_conf
                 sheet.cell(row=1, column=ratio_col_idx, value=ratio_name)
         
         # Add Excel formula for each row
-        print(f"\nAdding Excel formula for ratio column: {ratio_name}")
-        print(f"  = {numerator_name} / {denominator_name}")
+        print(f"\nAdding Excel formula for column: {ratio_name}")
+        if calc_type == 'diff':
+            print(f"  = {numerator_name} - {denominator_name}")
+        else:
+            print(f"  = {numerator_name} / {denominator_name}")
         
         formula_count = 0
         for row_idx in range(2, len(comparison_df) + 2):
             # Create Excel formula
-            formula = f"={get_column_letter(numerator_col)}{row_idx}/{get_column_letter(denominator_col)}{row_idx}"
+            if calc_type == 'diff':
+                formula = f"={get_column_letter(numerator_col)}{row_idx}-{get_column_letter(denominator_col)}{row_idx}"
+                number_format = "0.000"
+            else:  # ratio
+                formula = f"={get_column_letter(numerator_col)}{row_idx}/{get_column_letter(denominator_col)}{row_idx}"
+                number_format = "0.000"
             
             # Set the formula in the cell
             cell = sheet.cell(row=row_idx, column=ratio_col_idx)
             cell.value = formula
-            cell.number_format = "0.000"  # Format with 3 decimal places
+            cell.number_format = number_format
             
             # Add a comment explaining the formula
-            cell.comment = Comment(f"Formula: {numerator_name} / {denominator_name}", "Script")
+            if calc_type == 'diff':
+                cell.comment = Comment(f"Formula: {numerator_name} - {denominator_name}", "Script")
+            else:
+                cell.comment = Comment(f"Formula: {numerator_name} / {denominator_name}", "Script")
             formula_count += 1
         
         # Auto-adjust column width
@@ -590,7 +672,7 @@ def format_excel_workbook(writer, comparison_df, dataframes, folder_paths, missi
     if missing_backends_report:
         comparison_sheet = workbook['comparison']
         # Add a comment to cell A1 about missing backends
-        missing_text = "⚠️ Missing Backends for Ratio Columns:\n\n" + "\n".join(missing_backends_report)
+        missing_text = "⚠️ Missing Backends for Ratio/Diff Columns:\n\n" + "\n".join(missing_backends_report)
         comment = Comment(missing_text, "Data Processor")
         comparison_sheet['A1'].comment = comment
     
@@ -649,26 +731,32 @@ def format_excel_workbook(writer, comparison_df, dataframes, folder_paths, missi
             # Freeze header row for CSV sheets too
             sheet.freeze_panes = sheet['A2']
 
-def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, added_ratios, missing_benchmarks_report, missing_backends_report):
+def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, 
+                 added_ratios, missing_benchmarks_report, missing_backends_report,
+                 glesdmsaa_backend, grdawn_vk_backend):
     """Print a summary of the analysis."""
     print("\n" + "="*60)
     print("✅ Analysis complete!")
     
-    print("\n📁 Folders analyzed:")
-    for idx, folder_path in enumerate(folder_paths):
-        folder_name = Path(folder_path).name
-        exists = folder_exists_list[idx] if idx < len(folder_exists_list) else False
-        status = "✅ Analyzed" if exists else "⚠️  Skipped (not found)"
-        print(f"  {idx + 1}. {folder_name}: {status}")
         
-        # Show statistics for this folder if analysis was done
-        if exists and draw_types_maps and idx < len(draw_types_maps) and draw_types_maps[idx] is not None:
-            benches_with_info = sum(1 for v in draw_types_maps[idx].values() 
-                                   if not v.startswith("JSON file not found") 
-                                   and not v.startswith("Error")
-                                   and v != "Bench not found in trace files")
-            total_benches = len(draw_types_maps[idx])
-            print(f"     Benchmarks with trace info: {benches_with_info}/{total_benches}")
+    if folder_paths:
+        print("\n📁 Folders analyzed:")
+        for idx, folder_path in enumerate(folder_paths):
+            folder_name = Path(folder_path).name
+            exists = folder_exists_list[idx] if idx < len(folder_exists_list) else False
+            status = "✅ Analyzed" if exists else "⚠️  Skipped (not found)"
+            print(f"  {idx + 1}. {folder_name}: {status}")
+            
+            # Show statistics for this folder if analysis was done
+            if exists and draw_types_maps and idx < len(draw_types_maps) and draw_types_maps[idx] is not None:
+                benches_with_info = sum(1 for v in draw_types_maps[idx].values() 
+                                       if not v.startswith("JSON file not found") 
+                                       and not v.startswith("Error")
+                                       and v != "Bench not found in trace files")
+                total_benches = len(draw_types_maps[idx])
+                print(f"     Benchmarks with trace info: {benches_with_info}/{total_benches}")
+    else:
+        print("\n📁 No folders provided - trace analysis skipped")
     
     print(f"\n📊 CSV files processed: {len(dataframes)}")
     for csv_file, df in dataframes.items():
@@ -676,7 +764,16 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes,
     
     print(f"\n📈 Comparison page: {len(comparison_df)} benchmarks (common across all files)")
     print(f"   Base columns: ID, Bench, backend columns ({len(dataframes)}), summary columns ({len(folder_paths)})")
-    print(f"   Ratio columns added: {len(added_ratios)} ({', '.join(added_ratios) if added_ratios else 'None'})")
+    
+    # Show backend reference
+    if glesdmsaa_backend:
+        print(f"   Reference backend (glesdmsaa): {glesdmsaa_backend}")
+    if grdawn_vk_backend:
+        print(f"   Reference backend (grdawn_vk): {grdawn_vk_backend}")
+    
+    ratio_count = len([c for c in added_ratios if '(ratio)' in c])
+    diff_count = len([c for c in added_ratios if '(diff)' in c])
+    print(f"   Comparison columns added: {len(added_ratios)} total ({ratio_count} ratios, {diff_count} diffs)")
     
     # Report missing benchmarks
     if missing_benchmarks_report:
@@ -688,7 +785,7 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes,
     
     # Report missing backends
     if missing_backends_report:
-        print(f"\n⚠️  MISSING BACKENDS FOR RATIO CALCULATIONS ({len(missing_backends_report)}):")
+        print(f"\n⚠️  MISSING BACKENDS FOR COMPARISONS ({len(missing_backends_report)}):")
         for report in missing_backends_report:
             print(f"  {report}")
     
@@ -711,13 +808,25 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes,
     print("  - Only the first occurrence of each duplicate is used in comparisons")
     print("  - No error messages are written to Excel sheets")
     
-    # Note about ratio formulas
+    # Note about comparison columns
     if added_ratios:
-        print("\n📐 Ratio Columns Added (Excel Formulas):")
-        for ratio_col in added_ratios:
-            print(f"  - {ratio_col}: Calculated dynamically when Excel file is opened")
+        print("\n📐 Comparison Columns Added (Excel Formulas):")
+        ratio_cols = [c for c in added_ratios if '(ratio)' in c]
+        diff_cols = [c for c in added_ratios if '(diff)' in c]
+        if ratio_cols:
+            print("   Ratios (division):")
+            for col in ratio_cols[:5]:  # Show first 5
+                print(f"    - {col}")
+            if len(ratio_cols) > 5:
+                print(f"    ... and {len(ratio_cols) - 5} more")
+        if diff_cols:
+            print("   Diffs (subtraction):")
+            for col in diff_cols[:5]:  # Show first 5
+                print(f"    - {col}")
+            if len(diff_cols) > 5:
+                print(f"    ... and {len(diff_cols) - 5} more")
     else:
-        print("\n⚠️  No ratio columns were added due to missing backend requirements")
+        print("\n⚠️  No comparison columns were added due to missing backend requirements")
 
 def main():
     """Main function to orchestrate the script."""
@@ -739,24 +848,18 @@ def main():
     print("\n📖 Reading CSV files and checking for duplicates...")
     dataframes = read_csv_files(csv_files)
     
-    # Define ratio configurations
-    ratio_configs = [
-        {
-            'name': 'grdawn_vk vs glesdmsaa',
-            'numerator_patterns': ['grdawn_vk', 'grdawn-vk', 'grdawnvk'],
-            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
-        },
-        {
-            'name': 'vkdmsaa vs glesdmsaa',
-            'numerator_patterns': ['vkdmsaa', 'vk-dmsaa', 'vkdmsaa'],
-            'denominator_patterns': ['glesdmsaa', 'gles-dmsaa']
-        },
-        {
-            'name': 'grvk vs grdawn_vk',
-            'numerator_patterns': ['grvk', 'gr-vk', 'grvk'],
-            'denominator_patterns': ['grdawn_vk', 'grdawn-vk', 'grdawnvk']
-        }
-    ]
+    # Generate ratio configurations dynamically
+    print("\n🔧 Generating comparison configurations...")
+    ratio_configs, glesdmsaa_backend, grdawn_vk_backend = generate_ratio_configs(dataframes)
+    
+    if ratio_configs:
+        print(f"\n   Generated {len(ratio_configs)} comparison configurations:")
+        for config in ratio_configs:
+            calc_type = config.get('type', 'ratio')
+            print(f"    - {config['name']} ({calc_type})")
+    else:
+        print("\n   ⚠️  No comparison configurations generated!")
+        print("   Please ensure you have at least glesdmsaa backend or grdawn_vk backend available")
     
     # Validate backends and filter ratio configs
     valid_ratio_configs, missing_backends_report = validate_and_filter_backends(dataframes, ratio_configs)
@@ -801,7 +904,8 @@ def main():
     
     # Print summary
     print_summary(folder_paths, folder_exists_list, draw_types_maps, dataframes, comparison_df, 
-                 added_ratios, missing_benchmarks_report, missing_backends_report)
+                 added_ratios, missing_benchmarks_report, missing_backends_report,
+                 glesdmsaa_backend, grdawn_vk_backend)
     
     # Show sample of the comparison table structure (only for non-formula columns)
     print("\n📋 Sample of comparison table structure (first 5 rows, values from CSV data only):")
@@ -821,9 +925,8 @@ def main():
     # Display the dataframe sample (without ratio columns which are Excel-only formulas)
     if len(comparison_df) > 0:
         print(comparison_df[display_cols].head().to_string())
-        print("\n   Note: Ratio columns (grdawn_vk vs glesdmsaa, vkdmsaa vs glesdmsaa, grvk vs grdawn_vk)")
-        print("         are Excel formulas and not shown in this preview. They will appear when you")
-        print("         open the Excel file and will automatically calculate based on the backend columns.")
+        print("\n   Note: Comparison columns (ratios and diffs) are Excel formulas and not shown in this preview.")
+        print("         They will appear when you open the Excel file and will automatically calculate.")
     else:
         print("\n   ⚠️  No common benchmarks found to display!")
     
@@ -834,13 +937,17 @@ def main():
     print(f"  - Summary columns: {len(summary_cols)}")
     for col in summary_cols:
         print(f"    * {col}")
-    print(f"  - Ratio columns: {len(added_ratios)} (Excel formulas)")
-    for col in added_ratios:
-        print(f"    * {col}")
+    print(f"  - Comparison columns: {len(added_ratios)} (Excel formulas)")
+    ratio_cols = [c for c in added_ratios if '(ratio)' in c]
+    diff_cols = [c for c in added_ratios if '(diff)' in c]
+    if ratio_cols:
+        print(f"    * Ratios: {len(ratio_cols)} columns")
+    if diff_cols:
+        print(f"    * Diffs: {len(diff_cols)} columns")
     
     print("\n💡 Tips for using the Excel file:")
     print("  1. Use the drop-down arrows in any header to sort or filter data")
-    print("  2. Ratio columns automatically calculate: grdawn_vk/glesdmsaa, vkdmsaa/glesdmsaa, grvk/grdawn_vk")
+    print("  2. Comparison columns include both ratios (division) and diffs (subtraction)")
     print("  3. The first row and column are frozen for easy scrolling")
     print("  4. Table formatting updates automatically when you add/remove data")
     print("  5. All formulas recalculate when source data changes")
@@ -848,6 +955,7 @@ def main():
     print("  7. Individual CSV sheets contain ALL original data, comparison sheet only shows common benchmarks")
     print("  8. Dots in benchmark names are removed when locating JSON files (e.g., 'test.bench' -> 'testbench.json')")
     print("  9. Duplicate benchmark warnings are shown in console output only, not in Excel sheets")
+    print("  10. Reference backends: glesdmsaa and grdawn_vk are used as baselines for comparisons")
     
     print("\n" + "="*60)
 

@@ -56,41 +56,104 @@ MAJOR_VERSION = 2
 MINOR_VERSION = 9
 VERSION = f"{MAJOR_VERSION}.{MINOR_VERSION}"
 
+# Global variable for API version prefixes
+API_PREFIXES = ['api', 'r']
+SKIA_PREFIXES = ['m']
+
+# Build regex pattern dynamically from API_PREFIXES
+API_PATTERN = '|'.join(re.escape(prefix) for prefix in API_PREFIXES)
+SKIA_PATTERN = '|'.join(re.escape(prefix) for prefix in SKIA_PREFIXES)
+
+API_REGEX = re.compile(f'({API_PATTERN})(\\d+)', re.IGNORECASE)
+SKIA_REGEX = re.compile(f'({SKIA_PATTERN})(\\d+)', re.IGNORECASE)
+
 def extract_versions_from_filename(filename):
-    """Extract API version (api[0-9]+) and Skia version (m[0-9]+) from filename."""
+    """Extract API version (api[0-9]+ or r[0-9]+) and Skia version (m[0-9]+) from filename."""
     api_version = None
     skia_version = None
     
-    # Extract API version
-    api_match = re.search(r'api(\d+)', filename, re.IGNORECASE)
+    # Extract API version - uses global API_REGEX
+    api_match = API_REGEX.search(filename)
     if api_match:
-        api_version = f"api{api_match.group(1)}"
+        prefix = api_match.group(1).lower()
+        number = api_match.group(2)
+        api_version = f"{prefix}{number}"
     
-    # Extract Skia version (m[0-9]+) - no underscore required
-    skia_match = re.search(r'm(\d+)', filename, re.IGNORECASE)
+    # Extract Skia version - uses global SKIA_REGEX
+    skia_match = SKIA_REGEX.search(filename)
     if skia_match:
-        skia_version = f"m{skia_match.group(1)}"
+        prefix = skia_match.group(1).lower()
+        number = skia_match.group(2)
+        skia_version = f"{prefix}{number}"
     
     return api_version, skia_version
 
 def determine_baseline_and_compare(version_groups):
     """
     Determine which version is baseline and which is compare.
-    Returns baseline_version, compare_versions (clean), comparison_type
+    Rules:
+    - If there's only one version, use it as baseline and extract its components
+    - If input files have same Skia version, use Skia version as baseline, API version as compare
+    - If input files have same API version, use API version as baseline, Skia version as compare
+    - If neither, use the first version as baseline
     """
     versions = list(version_groups.keys())
     
+    # Handle single version case
     if len(versions) <= 1:
-        return versions[0] if versions else None, [], "single"
+        full_version = versions[0]
+        # Extract API and Skia from the single version
+        api_match = API_REGEX.search(full_version)
+        skia_match = SKIA_REGEX.search(full_version)
+        
+        if api_match and skia_match:
+            # Both API and Skia present - use Skia as baseline, API as compare
+            api_prefix = api_match.group(1).lower()
+            api_number = api_match.group(2)
+            skia_prefix = skia_match.group(1).lower()
+            skia_number = skia_match.group(2)
+            baseline_version = f"{skia_prefix}{skia_number}"
+            compare_versions = [f"{api_prefix}{api_number}"]
+            comparison_type = "single_with_both"
+            print(f"\n📌 Single version detected: {full_version}")
+            print(f"   Using Skia version as baseline: {baseline_version}")
+            print(f"   API version as compare: {compare_versions}")
+        elif api_match:
+            # Only API present
+            prefix = api_match.group(1).lower()
+            number = api_match.group(2)
+            baseline_version = f"{prefix}{number}"
+            compare_versions = [baseline_version]
+            comparison_type = "single_api_only"
+            print(f"\n📌 Single version detected: {full_version}")
+            print(f"   Using API version as baseline: {baseline_version}")
+        elif skia_match:
+            # Only Skia present
+            prefix = skia_match.group(1).lower()
+            number = skia_match.group(2)
+            baseline_version = f"{prefix}{number}"
+            compare_versions = [baseline_version]
+            comparison_type = "single_skia_only"
+            print(f"\n📌 Single version detected: {full_version}")
+            print(f"   Using Skia version as baseline: {baseline_version}")
+        else:
+            # No version detected
+            baseline_version = full_version
+            compare_versions = [baseline_version]
+            comparison_type = "single_no_version"
+            print(f"\n📌 Single version detected: {full_version}")
+            print(f"   Using full version as baseline: {baseline_version}")
+        
+        return baseline_version, compare_versions, comparison_type
     
-    # Extract components from version strings
+    # Extract components from version strings for multiple versions
     version_components = {}
     for version in versions:
-        api_match = re.search(r'api(\d+)', version)
-        skia_match = re.search(r'm(\d+)', version)
+        api_match = API_REGEX.search(version)
+        skia_match = SKIA_REGEX.search(version)
         version_components[version] = {
-            'api': f"api{api_match.group(1)}" if api_match else None,
-            'skia': f"m{skia_match.group(1)}" if skia_match else None,
+            'api': f"{api_match.group(1).lower()}{api_match.group(2)}" if api_match else None,
+            'skia': f"{skia_match.group(1).lower()}{skia_match.group(2)}" if skia_match else None,
             'full': version
         }
     
@@ -100,49 +163,65 @@ def determine_baseline_and_compare(version_groups):
         if v['skia']:
             skia_versions.add(v['skia'])
     
-    if len(skia_versions) == 1 and len(versions) > 1:
-        # Same Skia version across all files - use Skia as baseline, API as compare
-        baseline_version = list(skia_versions)[0]
-        # Compare versions are the API versions only (extract from full version)
-        compare_versions = []
-        for version in versions:
-            if version != baseline_version:
-                # Extract API part from the full version
-                api_match = re.search(r'api(\d+)', version)
-                if api_match:
-                    compare_versions.append(f"api{api_match.group(1)}")
-                else:
-                    compare_versions.append(version)
-        comparison_type = "same_skia_different_api"
-        print(f"\n📌 Detected: Same Skia version ({baseline_version}) across files")
-        print(f"   Using Skia version as baseline, API versions as compare: {compare_versions}")
-        return baseline_version, compare_versions, comparison_type
-    
     # Check if all versions have same API version
     api_versions = set()
     for v in version_components.values():
         if v['api']:
             api_versions.add(v['api'])
     
-    if len(api_versions) == 1 and len(versions) > 1:
-        # Same API version across all files - use API as baseline, Skia as compare
-        baseline_version = list(api_versions)[0]
-        # Compare versions are the Skia versions only (extract from full version)
+    # Case: All files have the SAME Skia version (regardless of API)
+    if len(skia_versions) == 1 and len(versions) > 1:
+        # Same Skia version across all files - use Skia as baseline
+        baseline_skia = list(skia_versions)[0]
+        baseline_version = baseline_skia
+        
+        # Compare versions are the API versions (extract from full version)
         compare_versions = []
         for version in versions:
-            if version != baseline_version:
-                # Extract Skia part from the full version
-                skia_match = re.search(r'm(\d+)', version)
-                if skia_match:
-                    compare_versions.append(f"m{skia_match.group(1)}")
-                else:
-                    compare_versions.append(version)
-        comparison_type = "same_api_different_skia"
-        print(f"\n📌 Detected: Same API version ({baseline_version}) across files")
-        print(f"   Using API version as baseline, Skia versions as compare: {compare_versions}")
+            api_match = API_REGEX.search(version)
+            if api_match:
+                compare_versions.append(f"{api_match.group(1).lower()}{api_match.group(2)}")
+            else:
+                compare_versions.append(version)
+        # Remove duplicates
+        seen = set()
+        compare_versions = [x for x in compare_versions if not (x in seen or seen.add(x))]
+        
+        # Determine if API versions are also the same
+        if len(api_versions) == 1:
+            comparison_type = "same_skia_same_api"
+            print(f"\n📌 Detected: Same Skia version ({baseline_skia}) AND same API version across files")
+        else:
+            comparison_type = "same_skia_different_api"
+            print(f"\n📌 Detected: Same Skia version ({baseline_skia}) across files")
+        
+        print(f"   Using Skia version as baseline, compare versions: {compare_versions}")
         return baseline_version, compare_versions, comparison_type
     
-    # Default: use first version as baseline, others as compare (full versions)
+    # Case: All files have the SAME API version (different Skia)
+    if len(api_versions) == 1 and len(versions) > 1:
+        # Same API version across all files - use API as baseline
+        baseline_api = list(api_versions)[0]
+        baseline_version = baseline_api
+        
+        # Compare versions are the Skia versions (extract from full version)
+        compare_versions = []
+        for version in versions:
+            skia_match = SKIA_REGEX.search(version)
+            if skia_match:
+                compare_versions.append(f"{skia_match.group(1).lower()}{skia_match.group(2)}")
+            else:
+                compare_versions.append(version)
+        # Remove duplicates
+        seen = set()
+        compare_versions = [x for x in compare_versions if not (x in seen or seen.add(x))]
+        
+        comparison_type = "same_api_different_skia"
+        print(f"\n📌 Detected: Same API version ({baseline_api}) across files")
+        print(f"   Using API version as baseline, compare versions: {compare_versions}")
+        return baseline_version, compare_versions, comparison_type
+    
+    # Default: use first version as baseline
     baseline_version = versions[0]
     compare_versions = versions[1:]
     comparison_type = "mixed_versions"
@@ -170,8 +249,8 @@ def get_next_version_number(base_filename):
 
 def generate_output_filename(baseline_version):
     """Generate output filename with baseline version."""
-    # Create base name: [baseline_version]_benchmark_comparison
-    base_name = f"{baseline_version}_benchmark_comparison"
+    # Create base name: [baseline_version]_crossplatform_comparison
+    base_name = f"{baseline_version}_crossplatform_comparison"
     
     # Get next version number
     version_num = get_next_version_number(base_name)
@@ -706,23 +785,43 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     
     print(f"    Backend columns found: {', '.join(backend_columns.keys())}")
     
-    # Add ratio and diff columns for this version (store as formula placeholders)
-    # Each config generates 2 columns: ratio (division) and diff (subtraction)
-    ratio_configs = [
-        ('grdawn_vk vs glesdmsaa', 'grdawn_vk', 'glesdmsaa'),
-        ('vkdmsaa vs glesdmsaa', 'vkdmsaa', 'glesdmsaa'),
-        ('grvk vs glesdmsaa', 'grvk', 'glesdmsaa'),
-        ('grvk vs vkdmsaa', 'grvk', 'vkdmsaa')
-    ]
+    # Generate ratio_configs dynamically:
+    # 1. Compare any backend (except glesdmsaa) with glesdmsaa
+    # 2. Compare any backend starting with 'gr' with grdawn_vk
+    # 3. Compare grvk with vkdmsaa if both exist
+    ratio_configs = []
+    
+    # Get all backends except glesdmsaa
+    other_backends = [b for b in backend_columns.keys() if b != 'glesdmsaa']
+    
+    # 1. Compare each backend with glesdmsaa
+    for backend in other_backends:
+        ratio_configs.append((f"{backend} vs glesdmsaa", backend, 'glesdmsaa'))
+    
+    # 2. Compare any backend starting with 'gr' with grdawn_vk (if grdawn_vk exists)
+    if 'grdawn_vk' in backend_columns:
+        gr_backends = [b for b in backend_columns.keys() if b.startswith('gr') and b != 'grdawn_vk']
+        for backend in gr_backends:
+            ratio_configs.append((f"{backend} vs grdawn_vk", backend, 'grdawn_vk'))
+    
+    # 3. Also add grvk vs vkdmsaa if both exist (skip if already added by above rules)
+    if 'grvk' in backend_columns and 'vkdmsaa' in backend_columns:
+        # Check if this config already exists
+        already_added = False
+        for config_name, _, _ in ratio_configs:
+            if config_name == 'grvk vs vkdmsaa':
+                already_added = True
+                break
+        if not already_added:
+            ratio_configs.append(('grvk vs vkdmsaa', 'grvk', 'vkdmsaa'))
+    
+    print(f"    Generated {len(ratio_configs)} ratio configurations:")
+    for config in ratio_configs:
+        print(f"      - {config[0]} = {config[1]}/{config[2]}")
     
     ratio_columns = []
     for config_name, num_backend, den_backend in ratio_configs:
-        print(f"    Processing config: {config_name}")
-        print(f"      Numerator: {num_backend}, Denominator: {den_backend}")
-        
         if num_backend in backend_columns and den_backend in backend_columns:
-            print(f"      ✓ Both backends found in data")
-            
             # Ratio column (division)
             ratio_col_name = f"{config_name} (ratio)"
             comparison_data[ratio_col_name] = [f"FORMULA:{num_backend}/{den_backend}"] * len(benches)
@@ -829,19 +928,19 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
     # Create mapping between full version tag and compare version
     version_mapping = {}
     for full_tag in version_groups.keys():
-        if comparison_type == "same_skia_different_api":
+        if comparison_type in ["same_skia_different_api", "same_skia_same_api"]:
             # Extract API part as compare version
-            api_match = re.search(r'api(\d+)', full_tag)
+            api_match = API_REGEX.search(full_tag)
             if api_match:
-                compare_ver = f"api{api_match.group(1)}"
+                compare_ver = f"{api_match.group(1).lower()}{api_match.group(2)}"
                 version_mapping[full_tag] = compare_ver
             else:
                 version_mapping[full_tag] = full_tag
         elif comparison_type == "same_api_different_skia":
             # Extract Skia part as compare version
-            skia_match = re.search(r'm(\d+)', full_tag)
+            skia_match = SKIA_REGEX.search(full_tag)
             if skia_match:
-                compare_ver = f"m{skia_match.group(1)}"
+                compare_ver = f"{skia_match.group(1).lower()}{skia_match.group(2)}"
                 version_mapping[full_tag] = compare_ver
             else:
                 version_mapping[full_tag] = full_tag
@@ -1203,7 +1302,8 @@ def backup_original_sheets(writer, all_original_sheets):
 def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
                   output_file, version_num, all_original_sheets, summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
-                  missing_backends, single_version_backends, baseline_version, compare_versions):
+                  missing_backends, single_version_backends, baseline_version, 
+                  compare_versions, comparison_type):
     """Print a summary of the analysis."""
     print("\n" + "="*60)
     print("✅ Analysis complete!")
@@ -1226,6 +1326,16 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_gro
     print(f"\n🎯 Baseline version: {baseline_version}")
     if compare_versions:
         print(f"   Compare versions: {', '.join(compare_versions)}")
+    
+    # Print comparison type
+    comparison_type_names = {
+        "same_skia_different_api": "Same Skia, Different API",
+        "same_api_different_skia": "Same API, Different Skia",
+        "same_skia_same_api": "Same Skia and Same API",
+        "mixed_versions": "Mixed Versions",
+        "single": "Single Version"
+    }
+    print(f"\n📋 Comparison type: {comparison_type_names.get(comparison_type, comparison_type)}")
     
     # Print column/backend coverage summary
     if missing_backends:
@@ -1260,13 +1370,21 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_gro
     print("\n📑 Sheets in output workbook:")
     for version in compare_versions:
         print(f"  - {version}_comparison (compare version page)")
-    if len(version_groups) > 1:
+    
+    # Only show cross-version sheet if it was created
+    if len(version_groups) > 1 and comparison_type != "same_skia_same_api":
         print("  - cross_version_comparison (baseline + compare versions side-by-side)")
+    elif comparison_type == "same_skia_same_api":
+        print("  - ℹ️ No cross-version comparison (all versions have same Skia and API)")
+    elif len(version_groups) <= 1:
+        print("  - ℹ️ No cross-version comparison (only one version found)")
+    
     print("  - backend_version (original data backups - unfiltered)")
     
     print("\n💡 Tips for using the Excel file:")
     print("  1. Compare version pages show benchmarks that exist in ALL backends of that version")
-    print("  2. Cross-version page shows baseline vs compare versions side-by-side")
+    if len(version_groups) > 1 and comparison_type != "same_skia_same_api":
+        print("  2. Cross-version page shows baseline vs compare versions side-by-side")
     print("  3. Original backup sheets contain complete unfiltered data")
     print("  4. Use drop-down arrows in headers to sort/filter data")
     print("  5. First row and column are frozen for easy scrolling")
@@ -1354,8 +1472,8 @@ def main():
                 else:
                     print(f"    ✗ Skipping '{compare_version}_comparison' - no common benchmarks found")
         
-        # Create cross-version comparison page (contains baseline + compare versions)
-        if len(version_groups) > 1:
+        # Create cross-version comparison page if multiple versions AND different versions exist
+        if len(version_groups) > 1 and comparison_type != "same_skia_same_api":
             print(f"\n  Creating cross-version comparison page")
             cross_version_df = create_cross_version_page(
                 version_groups, all_backends, summary_columns, missing_report, 
@@ -1370,15 +1488,21 @@ def main():
                 print(f"    ✓ Created 'cross_version_comparison' with {len(cross_version_df)} benchmarks, {len(cross_version_df.columns)} columns")
             else:
                 print(f"    ✗ Skipping 'cross_version_comparison' - no common benchmarks across all versions")
+        else:
+            if comparison_type == "same_skia_same_api":
+                print(f"\n  ℹ️ Skipping cross-version comparison - all versions have same Skia and API")
+            elif len(version_groups) <= 1:
+                print(f"\n  ℹ️ Skipping cross-version comparison - only one version found")
         
         # Backup original backend sheets
         backup_original_sheets(writer, all_original_sheets)
     
-    # Print summary
+    # Print summary - now with comparison_type
     print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
                   output_file, version_num, all_original_sheets, summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
-                  missing_backends, single_version_backends, baseline_version, compare_versions)
+                  missing_backends, single_version_backends, baseline_version, 
+                  compare_versions, comparison_type)
     
     print("\n" + "="*60)
     print(f"Benchmark Analysis Tool v{VERSION} - Execution Complete")
