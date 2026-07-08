@@ -229,27 +229,185 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     return draw_types_map
 
 def analyze_ftrace_files_graphite(folder_path, benches):
-    """Analyze ftrace JSON files for Graphite backend (TODO feature)."""
+    """Analyze ftrace JSON files for Graphite backend."""
     folder = Path(folder_path)
     draw_types_map = {}
     
+    # Compile regex patterns
+    submit_pattern = re.compile(r'skiatest::graphite::GraphiteTestContext::submitRecordingAndWaitOnSync')
+    snap_pattern = re.compile(r'skgpu::graphite::Recorder::snap')
+    draw_pass_pattern = re.compile(r'skgpu::graphite::DrawList::snapDrawPass')
+    
     for bench in benches:
-        # Sanitize bench name by removing dots for file lookup
-        sanitized_bench = sanitize_bench_name_for_file(bench)
-        json_file = folder / f"{sanitized_bench}.json"
-        
-        # Also try original name if sanitized version doesn't exist
-        if not json_file.exists():
-            json_file = folder / f"{bench}.json"
+        json_file = folder / f"{bench}.json"
+        submissions = []
         
         if json_file.exists():
-            # TODO: Implement Graphite-specific trace analysis
-            draw_types_map[bench] = "TODO: Graphite trace analysis not yet implemented"
+            try:
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                
+                state = [None, []]
+                
+                def process_trace(trace_data):
+                    if isinstance(trace_data, dict):
+                        func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
+                        
+                        if func_name:
+                            # Start of submission
+                            if submit_pattern.search(func_name):
+                                state[0] = {
+                                    'start_time': trace_data.get('timestamp', 0),
+                                    'renderers': [],
+                                    'draw_count': 0
+                                }
+                                state[1] = []
+                            
+                            # Snap event - update end_time and snap_time
+                            elif snap_pattern.search(func_name) and state[0] is not None:
+                                state[0]['snap_time'] = trace_data.get('timestamp', 0)
+                                state[0]['end_time'] = trace_data.get('timestamp', 0)
+                            
+                            # Draw pass event - parse draw count only
+                            elif draw_pass_pattern.search(func_name) and state[0] is not None:
+                                draw_count = 0
+                                args = trace_data.get('args', {})
+                                for key, value in args.items():
+                                    if 'draw count' in key.lower() or 'draw_count' in key.lower():
+                                        try:
+                                            draw_count = int(value)
+                                            break
+                                        except:
+                                            pass
+                                
+                                state[0]['draw_count'] = draw_count
+                                
+                                if state[1]:
+                                    state[0]['renderers'] = state[1]
+                                
+                                submissions.append(state[0])
+                                state[0] = None
+                                state[1] = []
+                            
+                            # Check for renderer in event arguments
+                            args = trace_data.get('args', {})
+                            for key, value in args.items():
+                                if key.lower().startswith('renderer'):
+                                    renderer_name = str(value)
+                                    if state[0] is not None:
+                                        state[1].append(renderer_name)
+                                    break
+                        
+                        for key, value in trace_data.items():
+                            if isinstance(value, (dict, list)):
+                                process_trace(value)
+                    elif isinstance(trace_data, list):
+                        for item in trace_data:
+                            process_trace(item)
+                
+                process_trace(data)
+                
+                if submissions:
+                    # Group submissions by config
+                    config_groups = {}
+                    
+                    for sub in submissions:
+                        renderer_count = len(sub['renderers'])
+                        draw_count = sub.get('draw_count', 0)
+                        config_key = f"m{renderer_count}_d{draw_count}"
+                        
+                        if config_key not in config_groups:
+                            config_groups[config_key] = {
+                                'count': 0,
+                                'renderer_count': renderer_count,
+                                'draw_count': draw_count,
+                                'renderers': sub['renderers'][:] if sub['renderers'] else []
+                            }
+                        config_groups[config_key]['count'] += 1
+                    
+                    # Separate valid configs (rdr == draw or rdr == draw + 1) and mismatches
+                    valid_configs = []
+                    mismatch_configs = []
+                    
+                    for config_key, data in config_groups.items():
+                        renderer_count = data['renderer_count']
+                        draw_count = data['draw_count']
+                        
+                        if renderer_count == draw_count or renderer_count == draw_count + 1:
+                            valid_configs.append((config_key, data))
+                        else:
+                            mismatch_configs.append((config_key, data))
+                    
+                    # Sort valid configs by count descending
+                    valid_configs.sort(key=lambda x: x[1]['count'], reverse=True)
+                    
+                    # Sort mismatch configs by count descending
+                    mismatch_configs.sort(key=lambda x: x[1]['count'], reverse=True)
+                    
+                    # Build summary parts
+                    summary_parts = []
+                    
+                    # Format ALL valid configs as sub#id: N[summary]
+                    for idx, (config_key, data) in enumerate(valid_configs):
+                        renderer_count = data['renderer_count']
+                        draw_count = data['draw_count']
+                        count = data['count']
+                        renderers = data['renderers']
+                        
+                        # Determine flush renderer and non-flush renderers
+                        if renderer_count == draw_count + 1:
+                            # With flush: first renderer is flush
+                            flush_r = renderers[0] if renderers else None
+                            non_flush_renderers = renderers[1:] if renderers and len(renderers) > 1 else []
+                        else:
+                            # Normal config (rdr == draw): no flush
+                            flush_r = None
+                            non_flush_renderers = renderers
+                        
+                        # Count non-flush renderers
+                        non_flush_counts = {}
+                        for r in non_flush_renderers:
+                            non_flush_counts[r] = non_flush_counts.get(r, 0) + 1
+                        
+                        # Build the summary string
+                        summary_parts_inner = []
+                        
+                        # Format non-flush renderers if they exist
+                        if non_flush_counts:
+                            sorted_non_flush = sorted(non_flush_counts.items(), key=lambda x: x[1], reverse=True)
+                            r_summary = ','.join([f"{name}:{cnt}" for name, cnt in sorted_non_flush])
+                            summary_parts_inner.append(r_summary)
+                        
+                        # Add flush renderer if exists
+                        if flush_r:
+                            summary_parts_inner.append(f"f:{flush_r}")
+                        
+                        # Special case: only flush renderer, no non-flush renderers (m1_d0 or similar)
+                        if not non_flush_counts and flush_r:
+                            summary = f"rdr:0|f:{flush_r}"
+                        else:
+                            summary = '|'.join(summary_parts_inner) if summary_parts_inner else f"{renderer_count}rdr"
+                        
+                        # All valid configs use sub#id format
+                        summary_parts.append(f"sub{idx+1}: {count}[{summary}]")
+                    
+                    # Format mismatch configs as mis#id: N[summary] - shortened
+                    for idx, (config_key, data) in enumerate(mismatch_configs):
+                        renderer_count = data['renderer_count']
+                        draw_count = data['draw_count']
+                        count = data['count']
+                        
+                        # Shortened mismatch summary: just count and the mismatch info
+                        summary_parts.append(f"mis{idx+1}: {count}[{renderer_count}rdr vs {draw_count}draw]")
+                    
+                    draw_types_map[bench] = ' | '.join(summary_parts)
+                else:
+                    draw_types_map[bench] = "No submissions"
+                    
+            except Exception as e:
+                draw_types_map[bench] = f"Error: {str(e)[:30]}"
         else:
-            if sanitized_bench != bench:
-                draw_types_map[bench] = f"JSON file not found (tried: {sanitized_bench}.json and {bench}.json)"
-            else:
-                draw_types_map[bench] = f"JSON file not found: {json_file}"
+            draw_types_map[bench] = f"No JSON"
     
     return draw_types_map
 
