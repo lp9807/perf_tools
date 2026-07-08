@@ -17,6 +17,6 @@ echo "Input:  $INPUT_FILE"
 echo "Output: $OUTPUT_FILE"
 
 # Your processing command goes here (e.g., mv, cp, or awk)
-head -n 1 $INPUT_FILE > $OUTPUT_FILE
+awk '/min,/ {print; exit}' $INPUT_FILE > $OUTPUT_FILE
 cat $INPUT_FILE | grep '^[0-9]' >> $OUTPUT_FILE
 echo "Processing Done."
