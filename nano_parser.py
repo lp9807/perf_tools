@@ -239,7 +239,8 @@ def analyze_ftrace_files_graphite(folder_path, benches):
     draw_pass_pattern = re.compile(r'skgpu::graphite::DrawList::snapDrawPass')
     
     for bench in benches:
-        json_file = folder / f"{bench}.json"
+        sanitized_bench = sanitize_bench_name_for_file(bench)
+        json_file = folder / f"{sanitized_bench}.json"
         submissions = []
         
         if json_file.exists():
@@ -325,49 +326,43 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                             }
                         config_groups[config_key]['count'] += 1
                     
-                    # Separate valid configs (rdr == draw or rdr == draw + 1) and mismatches
-                    valid_configs = []
-                    mismatch_configs = []
-                    
-                    for config_key, data in config_groups.items():
-                        renderer_count = data['renderer_count']
-                        draw_count = data['draw_count']
-                        
-                        if renderer_count == draw_count or renderer_count == draw_count + 1:
-                            valid_configs.append((config_key, data))
-                        else:
-                            mismatch_configs.append((config_key, data))
-                    
-                    # Sort valid configs by count descending
-                    valid_configs.sort(key=lambda x: x[1]['count'], reverse=True)
-                    
-                    # Sort mismatch configs by count descending
-                    mismatch_configs.sort(key=lambda x: x[1]['count'], reverse=True)
+                    # Sort configs by count descending
+                    sorted_configs = sorted(config_groups.items(), key=lambda x: x[1]['count'], reverse=True)
                     
                     # Build summary parts
                     summary_parts = []
                     
-                    # Format ALL valid configs as sub#id: N[summary]
-                    for idx, (config_key, data) in enumerate(valid_configs):
+                    # Format ALL configs as sub#id: N[summary]
+                    for idx, (config_key, data) in enumerate(sorted_configs):
                         renderer_count = data['renderer_count']
                         draw_count = data['draw_count']
                         count = data['count']
                         renderers = data['renderers']
                         
-                        # Determine flush renderer and non-flush renderers
-                        if renderer_count == draw_count + 1:
-                            # With flush: first renderer is flush
-                            flush_r = renderers[0] if renderers else None
-                            non_flush_renderers = renderers[1:] if renderers and len(renderers) > 1 else []
-                        else:
-                            # Normal config (rdr == draw): no flush
-                            flush_r = None
+                        # Check for error condition: rdr < draw
+                        if renderer_count < draw_count:
+                            # Log error message to terminal
+                            print(f"    ERROR in {bench}: renderer_count ({renderer_count}) < draw_count ({draw_count}) for config {config_key} ({count} submissions)")
+                            
+                            # Treat as normal: no flush renderers, all renderers are non-flush
+                            flush_count = 0
+                            flush_renderers = []
                             non_flush_renderers = renderers
+                        else:
+                            # Normal case: rdr >= draw
+                            flush_count = renderer_count - draw_count
+                            flush_renderers = renderers[:flush_count] if flush_count > 0 else []
+                            non_flush_renderers = renderers[flush_count:] if flush_count > 0 else renderers
                         
                         # Count non-flush renderers
                         non_flush_counts = {}
                         for r in non_flush_renderers:
                             non_flush_counts[r] = non_flush_counts.get(r, 0) + 1
+                        
+                        # Count flush renderers
+                        flush_counts = {}
+                        for r in flush_renderers:
+                            flush_counts[r] = flush_counts.get(r, 0) + 1
                         
                         # Build the summary string
                         summary_parts_inner = []
@@ -378,29 +373,27 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                             r_summary = ','.join([f"{name}:{cnt}" for name, cnt in sorted_non_flush])
                             summary_parts_inner.append(r_summary)
                         
-                        # Add flush renderer if exists
-                        if flush_r:
-                            summary_parts_inner.append(f"f:{flush_r}")
+                        # Add flush renderers with "f:" prefix
+                        if flush_counts:
+                            sorted_flush = sorted(flush_counts.items(), key=lambda x: x[1], reverse=True)
+                            f_summary = ','.join([f"f:{name}:{cnt}" for name, cnt in sorted_flush])
+                            summary_parts_inner.append(f_summary)
                         
-                        # Special case: only flush renderer, no non-flush renderers (m1_d0 or similar)
-                        if not non_flush_counts and flush_r:
-                            summary = f"rdr:0|f:{flush_r}"
+                        # Special case: no renderers at all
+                        if not summary_parts_inner:
+                            summary = f"{renderer_count}rdr"
                         else:
-                            summary = '|'.join(summary_parts_inner) if summary_parts_inner else f"{renderer_count}rdr"
+                            summary = '|'.join(summary_parts_inner)
                         
-                        # All valid configs use sub#id format
+                        # Append draw_count if it's an error case (rdr < draw)
+                        if renderer_count < draw_count:
+                            summary = f"{summary}|draw:{draw_count}"
+                        
+                        # All configs use sub#id format
                         summary_parts.append(f"sub{idx+1}: {count}[{summary}]")
                     
-                    # Format mismatch configs as mis#id: N[summary] - shortened
-                    for idx, (config_key, data) in enumerate(mismatch_configs):
-                        renderer_count = data['renderer_count']
-                        draw_count = data['draw_count']
-                        count = data['count']
-                        
-                        # Shortened mismatch summary: just count and the mismatch info
-                        summary_parts.append(f"mis{idx+1}: {count}[{renderer_count}rdr vs {draw_count}draw]")
-                    
-                    draw_types_map[bench] = ' | '.join(summary_parts)
+                    # Join with ", " and add a newline at the end
+                    draw_types_map[bench] = ',\n'.join(summary_parts)
                 else:
                     draw_types_map[bench] = "No submissions"
                     
@@ -1041,7 +1034,7 @@ def main():
     comparison_df = create_comparison_page(dataframes, draw_types_maps, folder_paths, common_benches)
     
     # Generate output filename
-    output_file = "combined.xlsx"
+    output_file = "backend_comparison.xlsx"
     
     # Write to Excel with multiple sheets
     print(f"\n💾 Generating Excel workbook: {output_file}")
