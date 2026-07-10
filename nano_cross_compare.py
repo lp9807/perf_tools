@@ -264,22 +264,19 @@ def validate_arguments():
     """Validate command line arguments."""
     if len(sys.argv) < 2:
         print("Error: At least one argument required (Excel file)")
-        print(f"Usage: {sys.argv[0]} [<folder_path1>] [<folder_path2>] <excel_file1.xlsx> [<excel_file2.xlsx> ...]")
-        print("Note: Folder parameters are optional (0-2 folders), followed by at least one Excel file")
+        print(f"Usage: {sys.argv[0]} <excel_file1.xlsx> [<excel_file2.xlsx> ...]")
+        print("Note: At least one Excel file parameter.")
         sys.exit(1)
     
     # Parse arguments: first 0-2 could be folders, rest are Excel files
-    folder_paths = []
     excel_files = []
     
     # Check each argument
     for arg in sys.argv[1:]:
         if arg.lower().endswith('.xlsx') or arg.lower().endswith('.xls'):
             excel_files.append(arg)
-        elif len(folder_paths) < 2:  # Max 2 folders
-            folder_paths.append(arg)
         else:
-            print(f"Error: Maximum 2 folder parameters allowed. Extra parameter: '{arg}'")
+            print(f"Error: No other parameters allowed. Extra parameter: '{arg}'")
             sys.exit(1)
     
     if len(excel_files) == 0:
@@ -287,21 +284,13 @@ def validate_arguments():
         print(f"Usage: {sys.argv[0]} [<folder_path1>] [<folder_path2>] <excel_file1.xlsx> [<excel_file2.xlsx> ...]")
         sys.exit(1)
     
-    # Check if folders exist (warn but don't exit)
-    folder_exists = []
-    for folder_path in folder_paths:
-        exists = os.path.isdir(folder_path)
-        folder_exists.append(exists)
-        if not exists:
-            print(f"Warning: Folder path '{folder_path}' does not exist - trace analysis will be skipped for this folder")
-    
     # Check Excel files exist
     for excel_file in excel_files:
         if not os.path.isfile(excel_file):
             print(f"Error: Excel file '{excel_file}' does not exist")
             sys.exit(1)
     
-    return folder_paths, excel_files, folder_exists
+    return excel_files
 
 def detect_backend_type(folder_path):
     """Detect backend type from folder name."""
@@ -345,6 +334,40 @@ def extract_summary_columns_from_comparison(excel_file):
             
     except Exception as e:
         print(f"  Error reading comparison sheet from {Path(excel_file).name}: {e}")
+        return None
+
+def extract_summary_columns_for_version(excel_file, version_tag):
+    """Extract summary columns from comparison page for a specific version."""
+    try:
+        # Load the workbook
+        wb = load_workbook(excel_file, data_only=True)
+        
+        # Check if comparison sheet exists
+        if 'comparison' not in wb.sheetnames:
+            return None
+        
+        # Read the comparison sheet
+        df = pd.read_excel(excel_file, sheet_name='comparison')
+        
+        # Find columns that are summary columns
+        standard_columns = ['ID', 'Bench']
+        summary_columns = {}
+        
+        for col in df.columns:
+            if col not in standard_columns:
+                # Check if it looks like a summary column
+                if 'summary' in col.lower() or 'draw' in col.lower() or 'trace' in col.lower():
+                    summary_columns[col] = df[col].tolist()
+                    print(f"    - Found summary column for version {version_tag}: '{col}'")
+        
+        if summary_columns:
+            print(f"    Extracted {len(summary_columns)} summary columns from comparison page for version {version_tag}")
+            return summary_columns
+        else:
+            return None
+            
+    except Exception as e:
+        print(f"    Error reading comparison sheet from {Path(excel_file).name}: {e}")
         return None
 
 def check_columns_coverage(version_groups, all_backends):
@@ -548,6 +571,152 @@ def read_excel_sheets(excel_file, version_tag):
         print(f"Error reading Excel file '{excel_file}': {e}")
         return None, None, None
 
+def import_existing_comparison_page(excel_file, version_tag, version_data):
+    """Import existing comparison page from Excel file if it exists."""
+    try:
+        # Load the workbook with data_only=False to access formulas
+        wb = load_workbook(excel_file, data_only=False)
+        
+        # Check if comparison sheet exists
+        if 'comparison' not in wb.sheetnames:
+            print(f"    No existing 'comparison' sheet found in {Path(excel_file).name}")
+            return None
+        
+        # Get the comparison sheet
+        sheet = wb['comparison']
+        
+        # Read the sheet with formulas
+        # First, get all data as values
+        data = []
+        headers = []
+        
+        # Get headers from first row
+        for col_idx, cell in enumerate(sheet[1], 1):
+            if cell.value is not None:
+                headers.append(cell.value)
+            else:
+                headers.append(f"Unnamed: {col_idx}")
+        
+        # Read data rows
+        for row in sheet.iter_rows(min_row=2, values_only=False):
+            row_data = []
+            for cell in row:
+                if cell.value is not None:
+                    # Check if it's a formula
+                    if cell.data_type == 'f':  # 'f' means formula
+                        # Store as FORMULA: prefix with the formula string
+                        row_data.append(f"FORMULA:{cell.value}")
+                    else:
+                        row_data.append(cell.value)
+                else:
+                    row_data.append(None)
+            data.append(row_data)
+        
+        # Create DataFrame
+        df = pd.DataFrame(data, columns=headers)
+        
+        # Validate required columns
+        if 'Bench' not in df.columns:
+            print(f"    Warning: Existing comparison sheet missing 'Bench' column")
+            return None
+        
+        # Clean up columns: Remove empty columns, unnamed columns, and columns that are entirely NaN
+        columns_to_keep = []
+        for col in df.columns:
+            # Skip columns that are completely empty (all NaN or None)
+            if df[col].isna().all() or df[col].isnull().all():
+                print(f"    Skipping empty column: '{col}'")
+                continue
+            
+            # Skip unnamed columns (typically from Excel where columns outside table area)
+            if col.startswith('Unnamed:') or col == '' or col is None:
+                print(f"    Skipping unnamed column: '{col}'")
+                continue
+            
+            columns_to_keep.append(col)
+        
+        # Filter dataframe to only keep valid columns
+        if columns_to_keep:
+            df = df[columns_to_keep].copy()
+            print(f"    Kept {len(columns_to_keep)} columns: {', '.join(columns_to_keep)}")
+        else:
+            print(f"    Warning: No valid columns found after cleaning")
+            return None
+        
+        # Detect formula columns
+        formula_columns = []
+        if len(df) > 0:
+            for col in df.columns:
+                first_val = df[col].iloc[0]
+                if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
+                    formula_columns.append(col)
+        
+        if formula_columns:
+            print(f"    Detected formula columns: {', '.join(formula_columns)}")
+        
+        # Check if we need to filter benchmarks to those common across all backends
+        dataframes = version_data['dataframes']
+        backend_benchmarks = []
+        for df_backend in dataframes.values():
+            backend_benchmarks.append(set(df_backend['bench'].tolist()))
+        
+        if backend_benchmarks:
+            common_benchmarks = set.intersection(*backend_benchmarks)
+            # Filter the comparison dataframe to only include common benchmarks
+            filtered_df = df[df['Bench'].isin(common_benchmarks)].copy()
+            
+            # Sort by Bench name for consistency
+            filtered_df = filtered_df.sort_values('Bench').reset_index(drop=True)
+            
+            # Ensure ID column exists and is sequential
+            if 'ID' in filtered_df.columns:
+                # If ID exists, keep it but renumber
+                filtered_df['ID'] = range(1, len(filtered_df) + 1)
+            else:
+                # Insert ID as first column
+                filtered_df.insert(0, 'ID', range(1, len(filtered_df) + 1))
+            
+            print(f"    ✓ Imported existing comparison page: {len(filtered_df)} benchmarks (filtered to common backends)")
+            print(f"    Columns preserved (including all config columns): {', '.join(filtered_df.columns.tolist())}")
+            
+            # Detect and report config columns (columns that look like ratio/diff)
+            config_columns = [col for col in filtered_df.columns if 'ratio' in col.lower() or 'diff' in col.lower() or 'vs' in col.lower()]
+            if config_columns:
+                print(f"    Detected config columns: {', '.join(config_columns)}")
+            
+            return filtered_df
+        else:
+            # If no filtering needed, just return the cleaned dataframe
+            # Ensure ID column exists and is sequential
+            if 'ID' in df.columns:
+                df['ID'] = range(1, len(df) + 1)
+            else:
+                df.insert(0, 'ID', range(1, len(df) + 1))
+            
+            print(f"    ✓ Imported existing comparison page: {len(df)} benchmarks")
+            print(f"    Columns preserved (including all config columns): {', '.join(df.columns.tolist())}")
+            
+            # Detect and report config columns
+            config_columns = [col for col in df.columns if 'ratio' in col.lower() or 'diff' in col.lower() or 'vs' in col.lower()]
+            if config_columns:
+                print(f"    Detected config columns: {', '.join(config_columns)}")
+            
+            return df
+            
+    except Exception as e:
+        print(f"    Error importing comparison sheet from {Path(excel_file).name}: {e}")
+        return None
+
+def check_existing_comparison_page(excel_file):
+    """Check if a comparison page exists in the Excel file."""
+    try:
+        wb = load_workbook(excel_file, data_only=True)
+        exists = 'comparison' in wb.sheetnames
+        wb.close()
+        return exists
+    except Exception as e:
+        return False
+        
 def read_multiple_excel_files(excel_files):
     """Read all Excel files and combine their data."""
     all_dataframes = {}
@@ -555,15 +724,12 @@ def read_multiple_excel_files(excel_files):
     version_info = {}
     all_original_sheets = {}
     version_groups = defaultdict(dict)  # Group data by version tag
+    summary_columns_by_version = {}  # Store summary columns per version
+    has_comparison_page = {}  # Track which versions have existing comparison pages
     
     print(f"\n📖 Reading Excel files...")
     
-    # Extract summary columns from the first Excel file's comparison page
-    summary_columns = None
-    if excel_files:
-        print(f"\n📋 Checking first Excel file for existing comparison page: {Path(excel_files[0]).name}")
-        summary_columns = extract_summary_columns_from_comparison(excel_files[0])
-    
+    # Process each Excel file
     for excel_file in excel_files:
         filename = Path(excel_file).stem
         api_version, skia_version = extract_versions_from_filename(filename)
@@ -582,6 +748,21 @@ def read_multiple_excel_files(excel_files):
             version_tag = "default"
             print(f"\n📖 Reading Excel file: {Path(excel_file).name} (no version detected)")
         
+        # Check if comparison page exists
+        has_comparison = check_existing_comparison_page(excel_file)
+        has_comparison_page[version_tag] = has_comparison
+        if has_comparison:
+            print(f"  ✓ Found existing 'comparison' page in this file")
+        else:
+            print(f"  ℹ️ No existing 'comparison' page found")
+        
+        # Extract summary columns from this file's comparison page
+        print(f"  Checking for existing summary columns...")
+        summary_columns = extract_summary_columns_for_version(excel_file, version_tag)
+        if summary_columns:
+            summary_columns_by_version[version_tag] = summary_columns
+        
+        # Read the sheets
         dataframes, original_sheets, backend_mapping = read_excel_sheets(excel_file, version_tag)
         
         if dataframes and original_sheets and backend_mapping:
@@ -599,13 +780,20 @@ def read_multiple_excel_files(excel_files):
             version_groups[version_tag]['backend_mapping'] = backend_mapping
             version_groups[version_tag]['api'] = api_version
             version_groups[version_tag]['skia'] = skia_version
+            version_groups[version_tag]['has_comparison_page'] = has_comparison
+            
+            # Store summary columns for this version
+            if summary_columns:
+                version_groups[version_tag]['summary_columns'] = summary_columns
             
             version_info[version_tag] = {
                 'file': excel_file,
                 'columns': list(dataframes.keys()),
                 'api': api_version,
                 'skia': skia_version,
-                'backend_mapping': backend_mapping
+                'backend_mapping': backend_mapping,
+                'has_summary': summary_columns is not None,
+                'has_comparison_page': has_comparison
             }
             
             # Collect unique backend names from the mapping
@@ -628,6 +816,17 @@ def read_multiple_excel_files(excel_files):
     # Check for missing benchmarks
     missing_report, unique_benchmarks, version_benchmarks = check_missing_benchmarks(version_groups)
     
+    # Determine which summary columns to use (prefer baseline version's summary if available)
+    primary_summary_columns = None
+    if baseline_version in summary_columns_by_version:
+        primary_summary_columns = summary_columns_by_version[baseline_version]
+        print(f"\n📋 Using summary columns from baseline version '{baseline_version}'")
+    elif summary_columns_by_version:
+        # Use the first available summary columns
+        first_version = list(summary_columns_by_version.keys())[0]
+        primary_summary_columns = summary_columns_by_version[first_version]
+        print(f"\n📋 Using summary columns from version '{first_version}' (baseline has no summary)")
+    
     print(f"\n📊 Summary: Loaded {len(all_dataframes)} backend columns from {len(excel_files)} files")
     print(f"   Backends found: {', '.join(sorted(all_backends))}")
     print(f"   Versions found: {', '.join(version_groups.keys())}")
@@ -636,115 +835,37 @@ def read_multiple_excel_files(excel_files):
     print(f"   Original sheets to backup: {len(all_original_sheets)}")
     
     return (all_dataframes, all_backends, version_info, version_groups, 
-            all_original_sheets, summary_columns, missing_report, 
+            all_original_sheets, primary_summary_columns, missing_report, 
             unique_benchmarks, duplicate_report, missing_backends, 
             single_version_backends, version_benchmarks, baseline_version, 
-            compare_versions, comparison_type)
+            compare_versions, comparison_type, summary_columns_by_version, has_comparison_page)
 
-def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
-    """Analyze ftrace JSON files for Ganesh backend."""
-    folder = Path(folder_path)
-    draw_types_map = {}
-    
-    # Pattern to match SurfaceDrawContext::draw* functions
-    draw_pattern = re.compile(r'ScalerContext::draw([a-zA-Z]+)')
-    # Pattern to match GrDrawingManager::flush specifically
-    flush_pattern = re.compile(r'GrDrawingManager::flush')
-    
-    for bench in benches:
-        json_file = folder / f"{bench}.json"
-        draw_counts = {}
-        flush_count = 0
-        
-        if json_file.exists():
-            try:
-                with open(json_file, 'r') as f:
-                    data = json.load(f)
-                
-                # Handle different ftrace JSON structures
-                def process_trace(trace_data):
-                    nonlocal flush_count
-                    if isinstance(trace_data, dict):
-                        # Check for function name in common fields
-                        func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
-                        if func_name:
-                            # Count draw types
-                            draw_match = draw_pattern.search(func_name)
-                            if draw_match:
-                                draw_type = draw_match.group(1)
-                                draw_counts[draw_type] = draw_counts.get(draw_type, 0) + 1
-                            
-                            # Count GrDrawingManager::flush calls
-                            if flush_pattern.search(func_name):
-                                flush_count += 1
-                        
-                        # Recursively process nested structures
-                        for value in trace_data.values():
-                            if isinstance(value, (dict, list)):
-                                process_trace(value)
-                    elif isinstance(trace_data, list):
-                        for item in trace_data:
-                            process_trace(item)
-                
-                process_trace(data)
-                
-                if draw_counts and flush_count > 0:
-                    # Calculate division result for each draw type: total_count / flush_count
-                    sorted_counts = sorted(draw_counts.items(), key=lambda x: x[1], reverse=True)
-                    result_parts = []
-                    for draw_type, count in sorted_counts:
-                        division_result = count / flush_count
-                        # Format with 2 decimal places for the division result
-                        result_parts.append(f"{draw_type}:{division_result:.2f}")
-                    draw_types_map[bench] = ', '.join(result_parts)
-                elif draw_counts:
-                    draw_types_map[bench] = f"No flush calls found. Draw types: {', '.join([f'{dt}:{cnt}' for dt, cnt in draw_counts.items()])}"
-                else:
-                    draw_types_map[bench] = "No draw functions found"
-                    
-            except Exception as e:
-                draw_types_map[bench] = f"Error parsing JSON: {str(e)[:50]}"
-        else:
-            draw_types_map[bench] = f"JSON file not found: {json_file}"
-    
-    return draw_types_map
-
-def analyze_ftrace_files_graphite(folder_path, benches):
-    """Analyze ftrace JSON files for Graphite backend (TODO feature)."""
-    folder = Path(folder_path)
-    draw_types_map = {}
-    
-    for bench in benches:
-        json_file = folder / f"{bench}.json"
-        
-        if json_file.exists():
-            # TODO: Implement Graphite-specific trace analysis
-            draw_types_map[bench] = "TODO: Graphite trace analysis not yet implemented"
-        else:
-            draw_types_map[bench] = f"JSON file not found: {json_file}"
-    
-    return draw_types_map
-
-def analyze_ftrace_files(folder_path, benches, folder_exists, folder_name):
-    """Main dispatcher for ftrace analysis based on backend type."""
-    if not folder_exists:
-        print(f"\n⚠️  Skipping trace file analysis for '{folder_name}': Folder does not exist")
-        return None
-    
-    backend_type = detect_backend_type(folder_path)
-    print(f"  Backend type for '{folder_name}': {backend_type.upper()}")
-    
-    if backend_type == 'graphite':
-        return analyze_ftrace_files_graphite(folder_path, benches)
-    else:  # ganesh
-        return analyze_ftrace_files_ganesh(folder_path, benches, folder_name)
-
-def create_version_comparison_page(version_data, version_name, folder_paths, draw_types_maps, 
+def create_version_comparison_page(version_data, version_name,
                                     summary_columns, missing_benchmarks_for_version, 
                                     version_benchmarks, baseline_version, is_baseline=False):
     """Create comparison page for a specific version."""
     dataframes = version_data['dataframes']
     backend_mapping = version_data['backend_mapping']
+    
+    # Use version-specific summary columns if available, otherwise use the provided ones
+    version_summary_columns = version_data.get('summary_columns', summary_columns)
+    
+    # Check if we have an existing comparison page to import
+    has_existing = version_data.get('has_comparison_page', False)
+    excel_file = version_data.get('file')
+    
+    if has_existing and excel_file:
+        print(f"    Found existing comparison page in {Path(excel_file).name} - importing it")
+        imported_df = import_existing_comparison_page(excel_file, version_name, version_data)
+        if imported_df is not None and not imported_df.empty:
+            print(f"    ✓ Successfully imported existing comparison page with {len(imported_df)} benchmarks")
+            print(f"    ✓ Preserved all existing columns including configs")
+            return imported_df
+        else:
+            print(f"    ⚠️ Failed to import existing comparison page, generating new one")
+    
+    # If no existing page or import failed, generate using current logic
+    print(f"    Generating new comparison page for version: {version_name}")
     
     # Find benchmarks that exist in ALL backends for this version
     backend_benchmarks = []
@@ -842,19 +963,14 @@ def create_version_comparison_page(version_data, version_name, folder_paths, dra
     
     print(f"    Total columns added: {len(ratio_columns)} (ratio + diff)")
     
-    # Add summary columns from existing comparison page if provided
-    if summary_columns:
-        for col_name, col_values in summary_columns.items():
+    # Add summary columns from this version's comparison page if provided
+    if version_summary_columns:
+        for col_name, col_values in version_summary_columns.items():
             if len(col_values) == len(benches):
                 comparison_data[col_name] = col_values
-    
-    # Add trace analysis summary columns from folders if provided (only for common benchmarks)
-    if folder_paths and draw_types_maps:
-        for idx, folder_path in enumerate(folder_paths):
-            folder_name = Path(folder_path).name
-            if idx < len(draw_types_maps) and draw_types_maps[idx] is not None:
-                summary_col_name = f"trace_summary_of_{folder_name}"
-                comparison_data[summary_col_name] = [draw_types_maps[idx].get(bench, "No trace data") for bench in benches]
+                print(f"      ✓ Added summary column: '{col_name}'")
+            else:
+                print(f"      ✗ WARNING: Summary column '{col_name}' has {len(col_values)} values, expected {len(benches)}")
     
     # Create DataFrame
     df = pd.DataFrame(comparison_data)
@@ -972,11 +1088,11 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
             comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
             column_names[display_name] = display_name
     
-    # Add ratio columns comparing ALL possible pairs of compare versions
+    # Add ratio AND diff columns comparing ALL possible pairs of compare versions
     # Only compare between compare_versions, NOT including baseline
     backends = ['grdawn_vk', 'glesdmsaa', 'vkdmsaa', 'grvk']
     
-    print(f"    Generating ratio columns for all compare version pairs...")
+    print(f"    Generating ratio and diff columns for all compare version pairs...")
     
     # Generate pairs only from compare_versions (exclude baseline)
     for i, version1 in enumerate(compare_versions):
@@ -987,9 +1103,14 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
                 
                 if col1_name in column_names and col2_name in column_names:
                     # Generate ratio: version1 vs version2
-                    ratio_col_name = f"{backend}_{version1}_vs_{version2}"
+                    ratio_col_name = f"{backend}_{version1}_vs_{version2}(ratio)"
                     comparison_data[ratio_col_name] = [f"FORMULA:{col1_name}/{col2_name}"] * len(benches)
-                    print(f"      Added: {ratio_col_name} = {col1_name}/{col2_name}")
+                    print(f"      Added ratio: {ratio_col_name} = {col1_name}/{col2_name}")
+                    
+                    # Generate diff: version1 vs version2
+                    diff_col_name = f"{backend}_{version1}_vs_{version2}(diff)"
+                    comparison_data[diff_col_name] = [f"FORMULA:{col1_name}-{col2_name}"] * len(benches)
+                    print(f"      Added diff: {diff_col_name} = {col1_name}-{col2_name}")
                 else:
                     if col1_name not in column_names:
                         print(f"      Warning: Missing column {col1_name}")
@@ -1060,13 +1181,20 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
     # First write the dataframe values without formulas
     df_for_write = df.copy()
     
-    # Replace formula placeholders with None for initial write
+    # Store formula information before clearing
+    formula_info = {}
     for col in df_for_write.columns:
-        if df_for_write[col].dtype == 'object':
-            if len(df_for_write) > 0:
-                first_val = df_for_write[col].iloc[0]
-                if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
-                    df_for_write[col] = None
+        if len(df_for_write) > 0:
+            # Check if this column contains formulas
+            col_formulas = []
+            for idx, val in enumerate(df_for_write[col]):
+                if isinstance(val, str) and val.startswith('FORMULA:'):
+                    col_formulas.append((idx, val[8:]))  # Remove 'FORMULA:' prefix
+            if col_formulas:
+                formula_info[col] = col_formulas
+                # Replace formula placeholders with None for initial write
+                for idx, _ in col_formulas:
+                    df_for_write[col].iloc[idx] = None
     
     # Write the dataframe
     df_for_write.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -1083,47 +1211,100 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
     # The last data row (excluding average row)
     last_data_row = len(df) + 1  # +1 for header
     
-    # Track which columns are formula columns
-    formula_columns = {}
-    
-    # Add formulas to each column
-    for col_idx, col_name in enumerate(df.columns, 1):
-        if len(df) > 0:
-            # Check if this is a formula column
-            first_val = df[col_name].iloc[0]
-            if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
-                # This is a formula column
-                formula_columns[col_name] = True
-                formula_expr = first_val[8:]  # Remove 'FORMULA:' prefix
+    # Add formulas from formula_info
+    for col_name, formulas in formula_info.items():
+        if col_name in col_letters:
+            col_letter = col_letters[col_name]
+            col_idx = list(df.columns).index(col_name) + 1
+            
+            # Check if this column's formulas reference other columns in our sheet
+            for row_idx_in_df, formula_expr in formulas:
+                excel_row = row_idx_in_df + 2  # +2 because: 0-based index, +1 for header, +1 for 1-based Excel
                 
-                if '/' in formula_expr:
-                    # Division formula
+                # Check if formula references columns that exist in our sheet
+                # Parse the formula to find column references
+                import re
+                col_refs = re.findall(r'([A-Z]+)\d+', formula_expr)
+                all_cols_exist = True
+                for col_ref in col_refs:
+                    # Check if this column reference corresponds to a column in our dataframe
+                    # This is a simplified check - we'd need to map column letters to actual column names
+                    pass
+                
+                # If the formula is a simple calculation, we can try to adjust it
+                if '/' in formula_expr and not formula_expr.startswith('='):
+                    # Simple division formula
                     parts = formula_expr.split('/')
                     if len(parts) == 2:
-                        num_col_name = parts[0]
-                        den_col_name = parts[1]
+                        num_col_name = parts[0].strip()
+                        den_col_name = parts[1].strip()
                         
                         if num_col_name in col_letters and den_col_name in col_letters:
                             num_col_letter = col_letters[num_col_name]
                             den_col_letter = col_letters[den_col_name]
-                            
-                            for row_idx in range(2, last_data_row + 1):
+                            formula = f"={num_col_letter}{excel_row}/{den_col_letter}{excel_row}"
+                            cell = sheet.cell(row=excel_row, column=col_idx)
+                            cell.value = formula
+                            cell.number_format = "0.000"
+                elif '-' in formula_expr and not formula_expr.startswith('='):
+                    # Simple subtraction formula
+                    parts = formula_expr.split('-')
+                    if len(parts) == 2:
+                        num_col_name = parts[0].strip()
+                        den_col_name = parts[1].strip()
+                        
+                        if num_col_name in col_letters and den_col_name in col_letters:
+                            num_col_letter = col_letters[num_col_name]
+                            den_col_letter = col_letters[den_col_name]
+                            formula = f"={num_col_letter}{excel_row}-{den_col_letter}{excel_row}"
+                            cell = sheet.cell(row=excel_row, column=col_idx)
+                            cell.value = formula
+                            cell.number_format = "0.000"
+                elif formula_expr.startswith('='):
+                    # This is an Excel formula that was imported
+                    # Try to preserve it as-is, but we may need to adjust row references
+                    # For now, use it directly
+                    cell = sheet.cell(row=excel_row, column=col_idx)
+                    cell.value = formula_expr
+                    if 'ratio' in col_name.lower() or 'diff' in col_name.lower():
+                        cell.number_format = "0.000"
+                else:
+                    # More complex formula - try to preserve it
+                    cell = sheet.cell(row=excel_row, column=col_idx)
+                    cell.value = f"={formula_expr}"
+                    if 'ratio' in col_name.lower() or 'diff' in col_name.lower():
+                        cell.number_format = "0.000"
+    
+    # Also check for formula columns that might not have been caught in formula_info
+    for col_idx, col_name in enumerate(df.columns, 1):
+        if len(df) > 0:
+            first_val = df[col_name].iloc[0]
+            if isinstance(first_val, str) and first_val.startswith('FORMULA:') and col_name not in formula_info:
+                # This column has formulas but wasn't caught in the initial detection
+                formula_expr = first_val[8:]
+                col_letter = get_column_letter(col_idx)
+                
+                for row_idx in range(2, last_data_row + 1):
+                    if '/' in formula_expr:
+                        parts = formula_expr.split('/')
+                        if len(parts) == 2:
+                            num_col_name = parts[0]
+                            den_col_name = parts[1]
+                            if num_col_name in col_letters and den_col_name in col_letters:
+                                num_col_letter = col_letters[num_col_name]
+                                den_col_letter = col_letters[den_col_name]
                                 formula = f"={num_col_letter}{row_idx}/{den_col_letter}{row_idx}"
                                 cell = sheet.cell(row=row_idx, column=col_idx)
                                 cell.value = formula
                                 cell.number_format = "0.000"
-                elif '-' in formula_expr:
-                    # Subtraction formula
-                    parts = formula_expr.split('-')
-                    if len(parts) == 2:
-                        num_col_name = parts[0]
-                        den_col_name = parts[1]
-                        
-                        if num_col_name in col_letters and den_col_name in col_letters:
-                            num_col_letter = col_letters[num_col_name]
-                            den_col_letter = col_letters[den_col_name]
-                            
-                            for row_idx in range(2, last_data_row + 1):
+                    elif '-' in formula_expr:
+                        parts = formula_expr.split('-')
+                        if len(parts) == 2:
+                            num_col_name = parts[0]
+                            den_col_name = parts[1]
+                            if num_col_name in col_letters and den_col_name in col_letters:
+                                num_col_letter = col_letters[num_col_name]
+                                den_col_letter = col_letters[den_col_name]
                                 formula = f"={num_col_letter}{row_idx}-{den_col_letter}{row_idx}"
                                 cell = sheet.cell(row=row_idx, column=col_idx)
                                 cell.value = formula
@@ -1142,24 +1323,20 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                 cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
                 cell.alignment = Alignment(horizontal='center', vertical='center')
             elif col_name not in ['ID']:
-                # Check if this column should have an average:
-                # 1. It's a formula column (will evaluate to number)
-                # 2. It's a numeric column
+                # Check if this column should have an average
                 should_have_average = False
                 
-                if col_name in formula_columns:
-                    # Formula column - will evaluate to number
+                # Check if it's a formula column
+                if col_name in formula_info or (len(df) > 0 and isinstance(df[col_name].iloc[0], str) and df[col_name].iloc[0].startswith('FORMULA:')):
                     should_have_average = True
                 else:
                     # Check if it's a numeric column by looking at the actual data
-                    # (excluding formula placeholders)
                     for check_row in range(2, min(last_data_row + 1, 10)):  # Check first few rows
                         cell_value = sheet.cell(row=check_row, column=idx).value
                         if cell_value is not None and isinstance(cell_value, (int, float)):
                             should_have_average = True
                             break
                         elif cell_value is not None and isinstance(cell_value, str):
-                            # Check if string represents a number
                             try:
                                 float(cell_value)
                                 should_have_average = True
@@ -1299,7 +1476,7 @@ def backup_original_sheets(writer, all_original_sheets):
         
         print(f"  ✓ Backed up '{sheet_name}' -> sheet '{final_sheet_name}' ({len(df)} rows)")
 
-def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
+def print_summary(draw_types_maps, version_groups, 
                   output_file, version_num, all_original_sheets, summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
                   missing_backends, single_version_backends, baseline_version, 
@@ -1307,16 +1484,6 @@ def print_summary(folder_paths, folder_exists_list, draw_types_maps, version_gro
     """Print a summary of the analysis."""
     print("\n" + "="*60)
     print("✅ Analysis complete!")
-    
-    if folder_paths:
-        print("\n📁 Folders analyzed:")
-        for idx, folder_path in enumerate(folder_paths):
-            folder_name = Path(folder_path).name
-            exists = folder_exists_list[idx] if idx < len(folder_exists_list) else False
-            status = "✅ Analyzed" if exists else "⚠️  Skipped (not found)"
-            print(f"  {idx + 1}. {folder_name}: {status}")
-    else:
-        print("\n📁 No folders provided - trace analysis skipped")
     
     print(f"\n📊 Versions processed: {len(version_groups)}")
     for version in version_groups.keys():
@@ -1396,14 +1563,7 @@ def main():
     print("="*60)
     
     # Validate arguments
-    folder_paths, excel_files, folder_exists_list = validate_arguments()
-    
-    if folder_paths:
-        print(f"\n📁 Folder paths ({len(folder_paths)}):")
-        for folder_path in folder_paths:
-            print(f"  - {folder_path}")
-    else:
-        print(f"\n📁 No folder paths provided - trace analysis will be skipped")
+    excel_files = validate_arguments()
     
     print(f"\n📄 Excel files ({len(excel_files)}):")
     for excel_file in excel_files:
@@ -1411,10 +1571,11 @@ def main():
     
     # Read all Excel files
     (all_dataframes, all_backends, version_info, version_groups, 
-     all_original_sheets, summary_columns, missing_report, 
+     all_original_sheets, primary_summary_columns, missing_report, 
      unique_benchmarks, duplicate_report, missing_backends, 
      single_version_backends, version_benchmarks, baseline_version, 
-     compare_versions, comparison_type) = read_multiple_excel_files(excel_files)
+     compare_versions, comparison_type, summary_columns_by_version, 
+     has_comparison_page) = read_multiple_excel_files(excel_files)
     
     # Get unique benches for JSON analysis
     all_benches = set()
@@ -1424,16 +1585,6 @@ def main():
     
     # Analyze ftrace files (if folders provided)
     draw_types_maps = []
-    if folder_paths:
-        print("\n🔍 Analyzing ftrace JSON files...")
-        for idx, folder_path in enumerate(folder_paths):
-            folder_name = Path(folder_path).name
-            print(f"\n  Processing folder {idx + 1}: {folder_name}")
-            folder_exists = folder_exists_list[idx] if idx < len(folder_exists_list) else False
-            draw_types_map = analyze_ftrace_files(folder_path, all_benches, folder_exists, folder_name)
-            draw_types_maps.append(draw_types_map)
-    else:
-        print("\n🔍 Skipping ftrace analysis - no folders provided")
     
     # Generate output filename with baseline version
     output_file, version_num = generate_output_filename(baseline_version)
@@ -1455,9 +1606,13 @@ def main():
                 print(f"\n  Creating comparison page for version: {compare_version}")
                 version_data = version_groups[full_version]
                 missing_for_version = missing_report.get(full_version, set())
+                
+                # Use version-specific summary columns if available
+                version_summary = version_data.get('summary_columns', primary_summary_columns)
+                
                 version_df = create_version_comparison_page(
-                    version_data, full_version, folder_paths, draw_types_maps, 
-                    summary_columns, missing_for_version, version_benchmarks,
+                    version_data, full_version, 
+                    version_summary, missing_for_version, version_benchmarks,
                     baseline_version, is_baseline=False
                 )
                 
@@ -1476,7 +1631,7 @@ def main():
         if len(version_groups) > 1 and comparison_type != "same_skia_same_api":
             print(f"\n  Creating cross-version comparison page")
             cross_version_df = create_cross_version_page(
-                version_groups, all_backends, summary_columns, missing_report, 
+                version_groups, all_backends, primary_summary_columns, missing_report, 
                 version_benchmarks, baseline_version, compare_versions, comparison_type
             )
             if cross_version_df is not None and not cross_version_df.empty:
@@ -1498,8 +1653,8 @@ def main():
         backup_original_sheets(writer, all_original_sheets)
     
     # Print summary - now with comparison_type
-    print_summary(folder_paths, folder_exists_list, draw_types_maps, version_groups, 
-                  output_file, version_num, all_original_sheets, summary_columns, 
+    print_summary(draw_types_maps, version_groups, 
+                  output_file, version_num, all_original_sheets, primary_summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
                   missing_backends, single_version_backends, baseline_version, 
                   compare_versions, comparison_type)
