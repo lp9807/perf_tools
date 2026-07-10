@@ -156,42 +156,43 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     
     # Pattern to match SurfaceDrawContext::draw* functions
     draw_pattern = re.compile(r'SurfaceDrawContext::draw([a-zA-Z]+)')
-    # Pattern to match GrDrawingManager::flush specifically
-    flush_pattern = re.compile(r'GrDrawingManager::flush')
+    # Pattern to match flush events
+    flush_pattern = re.compile(r'sk_gpu_test::TestContext::flushAndWaitOnSync')
     
     for bench in benches:
-        # Sanitize bench name by removing dots for file lookup
         sanitized_bench = sanitize_bench_name_for_file(bench)
         json_file = folder / f"{sanitized_bench}.json"
-        
-        # Also try original name if sanitized version doesn't exist
-        if not json_file.exists():
-            json_file = folder / f"{bench}.json"
-        
-        draw_counts = {}
-        flush_count = 0
+        submissions = []
         
         if json_file.exists():
             try:
                 with open(json_file, 'r') as f:
                     data = json.load(f)
                 
-                # Handle different ftrace JSON structures
+                # State: current_submission (dict with draw_types list)
+                state = [None]  # None or dict with 'draw_types' list
+                
                 def process_trace(trace_data):
-                    nonlocal flush_count
                     if isinstance(trace_data, dict):
-                        # Check for function name in common fields
                         func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
+                        
                         if func_name:
-                            # Count draw types
-                            draw_match = draw_pattern.search(func_name)
-                            if draw_match:
-                                draw_type = draw_match.group(1)
-                                draw_counts[draw_type] = draw_counts.get(draw_type, 0) + 1
-                            
-                            # Count GrDrawingManager::flush calls
+                            # Flush event - marks submission boundary
                             if flush_pattern.search(func_name):
-                                flush_count += 1
+                                # End current submission if one exists
+                                if state[0] is not None:
+                                    submissions.append(state[0])
+                                    state[0] = None
+                                # Start a new submission after flush
+                                state[0] = {
+                                    'draw_types': []
+                                }
+                            else:
+                                # Check for draw events (only if we're inside a submission)
+                                draw_match = draw_pattern.search(func_name)
+                                if draw_match and state[0] is not None:
+                                    draw_type = draw_match.group(1)
+                                    state[0]['draw_types'].append(draw_type)
                         
                         # Recursively process nested structures
                         for value in trace_data.values():
@@ -201,30 +202,75 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                         for item in trace_data:
                             process_trace(item)
                 
+                # Start processing with initial state
                 process_trace(data)
                 
-                if draw_counts and flush_count > 0:
-                    # Calculate division result for each draw type: total_count / flush_count
-                    sorted_counts = sorted(draw_counts.items(), key=lambda x: x[1], reverse=True)
-                    result_parts = []
-                    for draw_type, count in sorted_counts:
-                        division_result = count / flush_count
-                        # Format with 2 decimal places for the division result
-                        result_parts.append(f"{draw_type}:{division_result:.2f}")
-                    draw_types_map[bench] = ', '.join(result_parts)
-                elif draw_counts:
-                    draw_types_map[bench] = f"No flush calls found. Draw types: {', '.join([f'{dt}:{cnt}' for dt, cnt in draw_counts.items()])}"
+                # If there's an open non-empty submission at the end, close it
+                if state[0] is not None:
+                    if state[0]['draw_types'] and len(state[0]['draw_types']) > 0:
+                        submissions.append(state[0])
+                    state[0] = None
+                
+                if submissions:
+                    # Group submissions by draw type pattern
+                    config_groups = {}
+                    
+                    for sub in submissions:
+                        draw_types = sub['draw_types']
+                        draw_count = len(draw_types)
+                        
+                        # Count each draw type within this submission
+                        type_counts = {}
+                        for dt in draw_types:
+                            type_counts[dt] = type_counts.get(dt, 0) + 1
+                        
+                        
+                        # Create a config key from sorted type counts
+                        sorted_types = sorted(type_counts.items())
+                        config_key = ','.join([f"{t}:{c}" for t, c in sorted_types])
+                        if not config_key:
+                            config_key = "empty"
+                        config_key = f"d{draw_count}_{config_key}"
+                        
+                        if config_key not in config_groups:
+                            config_groups[config_key] = {
+                                'count': 0,
+                                'draw_count': draw_count,
+                                'type_counts': type_counts.copy()
+                            }
+                        config_groups[config_key]['count'] += 1
+                    
+                    # Sort configs by count descending
+                    sorted_configs = sorted(config_groups.items(), key=lambda x: x[1]['count'], reverse=True)
+                    
+                    # Build summary parts
+                    summary_parts = []
+                    
+                    # Format ALL configs as sub#id: N[summary]
+                    for idx, (config_key, data) in enumerate(sorted_configs):
+                        draw_count = data['draw_count']
+                        count = data['count']
+                        type_counts = data['type_counts']
+                        
+                        # Format the draw type summary
+                        if type_counts:
+                            sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+                            summary = ','.join([f"{t}:{c}" for t, c in sorted_types])
+                        else:
+                            summary = "empty"
+                        
+                        # All configs use sub#id format
+                        summary_parts.append(f"sub{idx+1}: {count}[{summary}]")
+                    
+                    # Join with ", " and add a newline at the end
+                    draw_types_map[bench] = ',\n'.join(summary_parts)
                 else:
-                    draw_types_map[bench] = "No draw functions found"
+                    draw_types_map[bench] = "No submissions"
                     
             except Exception as e:
-                draw_types_map[bench] = f"Error parsing JSON: {str(e)[:50]}"
+                draw_types_map[bench] = f"Error: {str(e)[:30]}"
         else:
-            # Check if we tried sanitized version but original might have existed
-            if sanitized_bench != bench:
-                draw_types_map[bench] = f"JSON file not found (tried: {sanitized_bench}.json and {bench}.json)"
-            else:
-                draw_types_map[bench] = f"JSON file not found: {json_file}"
+            draw_types_map[bench] = f"No JSON"
     
     return draw_types_map
 
