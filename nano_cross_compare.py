@@ -615,6 +615,22 @@ def import_existing_comparison_page(excel_file, version_tag, version_data):
         # Create DataFrame
         df = pd.DataFrame(data, columns=headers)
         
+        # Check if there's already an average row
+        has_average = False
+        average_row_data = None
+        
+        if 'Bench' in df.columns:
+            # Find rows where Bench contains 'AVERAGE' (case insensitive)
+            avg_mask = df['Bench'].astype(str).str.upper() == 'AVERAGE'
+            if avg_mask.any():
+                has_average = True
+                # Get the average row index
+                avg_idx = avg_mask[avg_mask].index[0]
+                average_row_data = df.iloc[avg_idx].to_dict()
+                # Remove the average row from the dataframe
+                df = df.drop(avg_idx).reset_index(drop=True)
+                print(f"    Found existing average row - will preserve it")
+        
         # Validate required columns
         if 'Bench' not in df.columns:
             print(f"    Warning: Existing comparison sheet missing 'Bench' column")
@@ -677,12 +693,19 @@ def import_existing_comparison_page(excel_file, version_tag, version_data):
                 filtered_df.insert(0, 'ID', range(1, len(filtered_df) + 1))
             
             print(f"    ✓ Imported existing comparison page: {len(filtered_df)} benchmarks (filtered to common backends)")
-            print(f"    Columns preserved (including all config columns): {', '.join(filtered_df.columns.tolist())}")
+            print(f"    Columns preserved: {', '.join(filtered_df.columns.tolist())}")
             
-            # Detect and report config columns (columns that look like ratio/diff)
+            # Detect and report config columns
             config_columns = [col for col in filtered_df.columns if 'ratio' in col.lower() or 'diff' in col.lower() or 'vs' in col.lower()]
             if config_columns:
                 print(f"    Detected config columns: {', '.join(config_columns)}")
+            
+            # If we have average row data, store it to be added back later
+            if has_average and average_row_data is not None:
+                # We'll add the average row back when writing
+                filtered_df.attrs['has_average'] = True
+                filtered_df.attrs['average_row'] = average_row_data
+                print(f"    ✓ Will restore average row when writing")
             
             return filtered_df
         else:
@@ -694,12 +717,19 @@ def import_existing_comparison_page(excel_file, version_tag, version_data):
                 df.insert(0, 'ID', range(1, len(df) + 1))
             
             print(f"    ✓ Imported existing comparison page: {len(df)} benchmarks")
-            print(f"    Columns preserved (including all config columns): {', '.join(df.columns.tolist())}")
+            print(f"    Columns preserved: {', '.join(df.columns.tolist())}")
             
             # Detect and report config columns
             config_columns = [col for col in df.columns if 'ratio' in col.lower() or 'diff' in col.lower() or 'vs' in col.lower()]
             if config_columns:
                 print(f"    Detected config columns: {', '.join(config_columns)}")
+            
+            # If we have average row data, store it to be added back later
+            if has_average and average_row_data is not None:
+                # We'll add the average row back when writing
+                df.attrs['has_average'] = True
+                df.attrs['average_row'] = average_row_data
+                print(f"    ✓ Will restore average row when writing")
             
             return df
             
@@ -1166,7 +1196,11 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
         print(f"    WARNING: DataFrame for '{sheet_name}' is empty, skipping")
         return
     
-    # Check if we have an average row
+    # Check if we have an average row from imported data
+    has_imported_average = df.attrs.get('has_average', False)
+    imported_avg_data = df.attrs.get('average_row', None)
+    
+    # Check if we have an average row in the dataframe itself
     has_average = False
     avg_data = None
     
@@ -1177,6 +1211,12 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
             avg_data = df.iloc[-1].to_dict()
             # Remove the average row from the dataframe
             df = df.iloc[:-1]
+    
+    # If we have imported average data and no average row in the dataframe, use it
+    if has_imported_average and imported_avg_data is not None and not has_average:
+        has_average = True
+        avg_data = imported_avg_data
+        print(f"    Using imported average row")
     
     # First write the dataframe values without formulas
     df_for_write = df.copy()
@@ -1222,7 +1262,6 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                 excel_row = row_idx_in_df + 2  # +2 because: 0-based index, +1 for header, +1 for 1-based Excel
                 
                 # Check if formula references columns that exist in our sheet
-                # Parse the formula to find column references
                 import re
                 col_refs = re.findall(r'([A-Z]+)\d+', formula_expr)
                 all_cols_exist = True
