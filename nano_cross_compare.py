@@ -1196,50 +1196,47 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
         print(f"    WARNING: DataFrame for '{sheet_name}' is empty, skipping")
         return
     
-    # Check if we have an average row from imported data
-    has_imported_average = df.attrs.get('has_average', False)
-    imported_avg_data = df.attrs.get('average_row', None)
-    
-    # Check if we have an average row in the dataframe itself
-    has_average = False
+    # Check if dataframe already has an average row
+    has_average_in_data = False
     avg_data = None
     
-    if add_average_row and len(df) > 0 and 'Bench' in df.columns:
-        if df.iloc[-1]['Bench'] == 'AVERAGE':
-            has_average = True
-            # Extract the average row data
+    if len(df) > 0 and 'Bench' in df.columns:
+        last_val = df.iloc[-1]['Bench'] if len(df) > 0 else None
+        if last_val == 'AVERAGE':
+            has_average_in_data = True
             avg_data = df.iloc[-1].to_dict()
             # Remove the average row from the dataframe
             df = df.iloc[:-1]
+            print(f"    Found average row in dataframe - will preserve it")
     
-    # If we have imported average data and no average row in the dataframe, use it
-    if has_imported_average and imported_avg_data is not None and not has_average:
-        has_average = True
+    # Check if imported dataframe has average in attrs
+    has_imported_average = df.attrs.get('has_average', False)
+    imported_avg_data = df.attrs.get('average_row', None)
+    
+    if not has_average_in_data and has_imported_average and imported_avg_data is not None:
+        has_average_in_data = True
         avg_data = imported_avg_data
-        print(f"    Using imported average row")
+        print(f"    Using imported average row from attrs")
     
-    # First write the dataframe values without formulas
+    # Write dataframe without formulas
     df_for_write = df.copy()
     
-    # Store formula information before clearing
+    # Store formula info
     formula_info = {}
     for col in df_for_write.columns:
         if len(df_for_write) > 0:
-            # Check if this column contains formulas
             col_formulas = []
             for idx, val in enumerate(df_for_write[col]):
                 if isinstance(val, str) and val.startswith('FORMULA:'):
-                    col_formulas.append((idx, val[8:]))  # Remove 'FORMULA:' prefix
+                    col_formulas.append((idx, val[8:]))
             if col_formulas:
                 formula_info[col] = col_formulas
-                # Replace formula placeholders with None for initial write
                 for idx, _ in col_formulas:
                     df_for_write[col].iloc[idx] = None
     
-    # Write the dataframe
+    # Write to Excel
     df_for_write.to_excel(writer, sheet_name=sheet_name, index=False)
     
-    # Now add the formulas directly to the Excel sheet
     workbook = writer.book
     sheet = workbook[sheet_name]
     
@@ -1248,36 +1245,20 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
     for idx, col_name in enumerate(df.columns, 1):
         col_letters[col_name] = get_column_letter(idx)
     
-    # The last data row (excluding average row)
-    last_data_row = len(df) + 1  # +1 for header
+    last_data_row = len(df) + 1
     
-    # Add formulas from formula_info
+    # Add formulas
     for col_name, formulas in formula_info.items():
         if col_name in col_letters:
-            col_letter = col_letters[col_name]
             col_idx = list(df.columns).index(col_name) + 1
-            
-            # Check if this column's formulas reference other columns in our sheet
             for row_idx_in_df, formula_expr in formulas:
-                excel_row = row_idx_in_df + 2  # +2 because: 0-based index, +1 for header, +1 for 1-based Excel
+                excel_row = row_idx_in_df + 2
                 
-                # Check if formula references columns that exist in our sheet
-                import re
-                col_refs = re.findall(r'([A-Z]+)\d+', formula_expr)
-                all_cols_exist = True
-                for col_ref in col_refs:
-                    # Check if this column reference corresponds to a column in our dataframe
-                    # This is a simplified check - we'd need to map column letters to actual column names
-                    pass
-                
-                # If the formula is a simple calculation, we can try to adjust it
                 if '/' in formula_expr and not formula_expr.startswith('='):
-                    # Simple division formula
                     parts = formula_expr.split('/')
                     if len(parts) == 2:
                         num_col_name = parts[0].strip()
                         den_col_name = parts[1].strip()
-                        
                         if num_col_name in col_letters and den_col_name in col_letters:
                             num_col_letter = col_letters[num_col_name]
                             den_col_letter = col_letters[den_col_name]
@@ -1286,12 +1267,10 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                             cell.value = formula
                             cell.number_format = "0.000"
                 elif '-' in formula_expr and not formula_expr.startswith('='):
-                    # Simple subtraction formula
                     parts = formula_expr.split('-')
                     if len(parts) == 2:
                         num_col_name = parts[0].strip()
                         den_col_name = parts[1].strip()
-                        
                         if num_col_name in col_letters and den_col_name in col_letters:
                             num_col_letter = col_letters[num_col_name]
                             den_col_letter = col_letters[den_col_name]
@@ -1300,110 +1279,104 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                             cell.value = formula
                             cell.number_format = "0.000"
                 elif formula_expr.startswith('='):
-                    # This is an Excel formula that was imported
-                    # Try to preserve it as-is, but we may need to adjust row references
-                    # For now, use it directly
                     cell = sheet.cell(row=excel_row, column=col_idx)
                     cell.value = formula_expr
                     if 'ratio' in col_name.lower() or 'diff' in col_name.lower():
                         cell.number_format = "0.000"
-                else:
-                    # More complex formula - try to preserve it
-                    cell = sheet.cell(row=excel_row, column=col_idx)
-                    cell.value = f"={formula_expr}"
-                    if 'ratio' in col_name.lower() or 'diff' in col_name.lower():
-                        cell.number_format = "0.000"
     
-    # Also check for formula columns that might not have been caught in formula_info
-    for col_idx, col_name in enumerate(df.columns, 1):
-        if len(df) > 0:
-            first_val = df[col_name].iloc[0]
-            if isinstance(first_val, str) and first_val.startswith('FORMULA:') and col_name not in formula_info:
-                # This column has formulas but wasn't caught in the initial detection
-                formula_expr = first_val[8:]
-                col_letter = get_column_letter(col_idx)
-                
-                for row_idx in range(2, last_data_row + 1):
-                    if '/' in formula_expr:
-                        parts = formula_expr.split('/')
-                        if len(parts) == 2:
-                            num_col_name = parts[0]
-                            den_col_name = parts[1]
-                            if num_col_name in col_letters and den_col_name in col_letters:
-                                num_col_letter = col_letters[num_col_name]
-                                den_col_letter = col_letters[den_col_name]
-                                formula = f"={num_col_letter}{row_idx}/{den_col_letter}{row_idx}"
-                                cell = sheet.cell(row=row_idx, column=col_idx)
-                                cell.value = formula
-                                cell.number_format = "0.000"
-                    elif '-' in formula_expr:
-                        parts = formula_expr.split('-')
-                        if len(parts) == 2:
-                            num_col_name = parts[0]
-                            den_col_name = parts[1]
-                            if num_col_name in col_letters and den_col_name in col_letters:
-                                num_col_letter = col_letters[num_col_name]
-                                den_col_letter = col_letters[den_col_name]
-                                formula = f"={num_col_letter}{row_idx}-{den_col_letter}{row_idx}"
-                                cell = sheet.cell(row=row_idx, column=col_idx)
-                                cell.value = formula
-                                cell.number_format = "0.000"
-    
-    # Add average row below the table (if it exists)
-    if has_average and avg_data:
-        avg_row_excel = last_data_row + 2  # Leave one empty row after table
+    # Add average row (single source of truth)
+    if add_average_row:
+        # If no average data exists, calculate it
+        if not has_average_in_data or avg_data is None:
+            print(f"    No existing average row - calculating new one")
+            avg_data = {}
+            for col_name in df.columns:
+                if col_name not in ['ID', 'Bench']:
+                    # Check if this column should have an average
+                    should_have_average = False
+                    
+                    # Check formula columns
+                    if col_name in formula_info:
+                        should_have_average = True
+                    else:
+                        # Check numeric values
+                        for val in df[col_name].head(5):
+                            if val is not None:
+                                try:
+                                    float(val)
+                                    should_have_average = True
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    
+                    if should_have_average:
+                        numeric_values = pd.to_numeric(df[col_name], errors='coerce')
+                        if not numeric_values.isna().all():
+                            avg_data[col_name] = numeric_values.mean()
+                        else:
+                            avg_data[col_name] = ''
+                    else:
+                        avg_data[col_name] = ''
+            avg_data['ID'] = ''
+            avg_data['Bench'] = 'AVERAGE'
+            has_average_in_data = True
+            print(f"    ✓ Calculated new average row")
         
-        # Add AVERAGE label
-        for idx, col_name in enumerate(df.columns, 1):
-            if col_name == 'Bench':
-                cell = sheet.cell(row=avg_row_excel, column=idx)
-                cell.value = "AVERAGE"
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-            elif col_name not in ['ID']:
-                # Check if this column should have an average
-                should_have_average = False
-                
-                # Check if it's a formula column
-                if col_name in formula_info or (len(df) > 0 and isinstance(df[col_name].iloc[0], str) and df[col_name].iloc[0].startswith('FORMULA:')):
-                    should_have_average = True
-                else:
-                    # Check if it's a numeric column by looking at the actual data
-                    for check_row in range(2, min(last_data_row + 1, 10)):  # Check first few rows
-                        cell_value = sheet.cell(row=check_row, column=idx).value
-                        if cell_value is not None and isinstance(cell_value, (int, float)):
-                            should_have_average = True
-                            break
-                        elif cell_value is not None and isinstance(cell_value, str):
-                            try:
-                                float(cell_value)
+        # Write the average row
+        if has_average_in_data and avg_data:
+            avg_row_excel = last_data_row + 2
+            
+            for idx, col_name in enumerate(df.columns, 1):
+                if col_name == 'Bench':
+                    cell = sheet.cell(row=avg_row_excel, column=idx)
+                    cell.value = "AVERAGE"
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                elif col_name not in ['ID']:
+                    should_have_average = False
+                    
+                    if col_name in formula_info:
+                        should_have_average = True
+                    else:
+                        for check_row in range(2, min(last_data_row + 1, 10)):
+                            cell_value = sheet.cell(row=check_row, column=idx).value
+                            if cell_value is not None and isinstance(cell_value, (int, float)):
                                 should_have_average = True
                                 break
-                            except:
-                                pass
-                
-                if should_have_average:
-                    # Add AVERAGE formula for numeric/formula columns
-                    col_letter = get_column_letter(idx)
-                    avg_formula = f"=AVERAGE({col_letter}2:{col_letter}{last_data_row + 1})"
-                    cell = sheet.cell(row=avg_row_excel, column=idx)
-                    cell.value = avg_formula
-                    cell.number_format = "0.000"
-                    cell.font = Font(bold=True)
-                    cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                else:
-                    # Non-numeric column - leave empty
-                    cell = sheet.cell(row=avg_row_excel, column=idx)
-                    cell.value = ""
-                    cell.font = Font(bold=True)
-                    cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-        
-        print(f"    ✓ Added average row at row {avg_row_excel} (outside table)")
+                            elif cell_value is not None and isinstance(cell_value, str):
+                                try:
+                                    float(cell_value)
+                                    should_have_average = True
+                                    break
+                                except:
+                                    pass
+                    
+                    if should_have_average:
+                        if col_name in avg_data and avg_data[col_name] not in ['', None]:
+                            cell = sheet.cell(row=avg_row_excel, column=idx)
+                            cell.value = avg_data[col_name]
+                            cell.number_format = "0.000"
+                        else:
+                            col_letter = get_column_letter(idx)
+                            avg_formula = f"=AVERAGE({col_letter}2:{col_letter}{last_data_row + 1})"
+                            cell = sheet.cell(row=avg_row_excel, column=idx)
+                            cell.value = avg_formula
+                            cell.number_format = "0.000"
+                        
+                        cell.font = Font(bold=True)
+                        cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                    else:
+                        cell = sheet.cell(row=avg_row_excel, column=idx)
+                        cell.value = ""
+                        cell.font = Font(bold=True)
+                        cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            print(f"    ✓ Added average row at row {avg_row_excel} (outside table)")
     
-    return df  # Return the modified dataframe (without average row)
+    return df
 
 def apply_table_formatting_to_sheet(sheet, df):
     """Apply Excel table formatting to a sheet."""
