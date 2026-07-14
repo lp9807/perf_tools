@@ -48,6 +48,17 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.comments import Comment
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.legend import Legend
+from openpyxl.chart.series import SeriesLabel
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.text import Paragraph, ParagraphProperties, CharacterProperties, Font as DrawingFont
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.drawing.line import LineProperties
+from openpyxl.chart.layout import Layout, ManualLayout
+from openpyxl.utils import get_column_letter
 from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
@@ -1202,7 +1213,204 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
     
     return df
 
-def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
+def add_frequency_formulas(dist_sheet, bin_values, data_columns, main_sheet_name, col_letters, data_start_row, data_end_row):
+    """Add FREQUENCY formulas as array formulas using openpyxl.worksheet.formula.ArrayFormula."""
+    # Column A: Bin values
+    bin_col_idx = 1
+    bin_col_letter = get_column_letter(bin_col_idx)
+    
+    # Write bin values in column A (starting from row 2)
+    num_bins = len(bin_values)
+    for row_idx, bin_val in enumerate(bin_values):
+        cell = dist_sheet.cell(row=row_idx + 2, column=bin_col_idx)
+        cell.value = bin_val
+    
+    # Bin range: A2:A{N+1}
+    bin_range = f"{bin_col_letter}2:{bin_col_letter}{num_bins + 1}"
+    
+    for col_name in data_columns:
+        if col_name in col_letters:
+            # Find which column this is in the distribution sheet
+            dist_col_idx = None
+            for idx, header in enumerate(dist_sheet[1], 1):
+                if header.value == col_name:
+                    dist_col_idx = idx
+                    break
+            
+            if dist_col_idx is not None:
+                main_col_letter = col_letters[col_name]
+                data_range = f"'{main_sheet_name}'!{main_col_letter}{data_start_row}:{main_col_letter}{data_end_row}"
+                
+                # FREQUENCY formula
+                # FREQUENCY returns N+1 values where N = number of bins
+                frequency_formula = f"=FREQUENCY({data_range},{bin_range})"
+                
+                # Determine the range for the array formula
+                # FREQUENCY returns N+1 values, so we need N+1 rows
+                start_row = 2
+                end_row = num_bins + 2  # N+1 values + offset for header
+                col_letter = get_column_letter(dist_col_idx)
+                array_range = f"{col_letter}{start_row}:{col_letter}{end_row}"
+                
+                # Set the array formula on the FIRST cell of the range only
+                # This prevents the @ symbol from appearing
+                first_cell = f"{col_letter}{start_row}"
+                dist_sheet[first_cell] = ArrayFormula(
+                    ref=array_range,
+                    text=frequency_formula
+                )
+
+def create_distribution_chart(dist_sheet, dist_df, chart_title, x_axis_title, y_axis_title, chart_position):
+    """Create a beautified clustered column chart for the distribution table."""
+    # Determine the data range
+    num_rows = len(dist_df)
+    num_cols = len(dist_df.columns)
+    
+    # Data starts at row 2 (row 1 is header), column 3 (C) is first data column
+    # X-axis labels are in column 2 (B) - the 'Label' column
+    x_labels_col = 2  # Column B
+    start_data_col = 3  # Column C
+    
+    # Create chart
+    chart = BarChart()
+    chart.type = "col"
+    chart.grouping = "clustered"
+    chart.style = 13  # Style 7
+    chart.height = 14  # Height in inches
+    chart.width = 22   # Width in inches
+    chart.overlap = 0
+    chart.gapWidth = 250
+    
+    chart.layout = Layout(
+        manualLayout=ManualLayout()
+    )
+    chart.layout.manualLayout.x = 0.01
+    chart.layout.manualLayout.y = 0.05
+    chart.layout.manualLayout.w = 0.94
+    chart.layout.manualLayout.h = 0.68
+    
+    # Set title with bold and size 18
+    chart.title = chart_title
+    # Use CharacterProperties for font styling
+    rt = chart.title.tx.rich
+    para = rt.p[0]
+    run = para.r[0]
+    run.rPr = CharacterProperties(
+        sz=1800,
+        b=True
+    )
+    
+    # Set legend position (bottom, no overlay)
+    chart.legend = Legend()
+    chart.legend.position = 'b'  # Bottom
+    chart.legend.overlay = False  # Don't overlay chart
+        
+    # Get the data range for the chart
+    data_start_row = 2  # First data row
+    data_end_row = num_rows + 1  # Last data row
+    
+    # Add all data series without titles
+    for col_idx in range(start_data_col, num_cols + 1):
+        values = Reference(dist_sheet, 
+                          min_col=col_idx, 
+                          min_row=data_start_row, 
+                          max_row=data_end_row)
+        chart.add_data(values, titles_from_data=False)
+    
+    # Get categories (x-axis labels) - use the Label column
+    categories = Reference(dist_sheet, 
+                          min_col=x_labels_col, 
+                          min_row=data_start_row, 
+                          max_row=data_end_row)
+    
+    # Set the categories for the chart
+    chart.set_categories(categories)
+    
+    # Configure x-axis title (bold)
+    chart.x_axis.title = x_axis_title
+    xrt = chart.x_axis.title.tx.rich
+    xpara = xrt.p[0]
+    xrun = xpara.r[0]
+    xrun.rPr = CharacterProperties(
+        sz=1100,
+        b=True
+    )
+
+    chart.x_axis.delete = False
+    chart.x_axis.tickLblPos = "low"
+    chart.x_axis.crosses = 'autoZero'
+    chart.x_axis.spPr = GraphicalProperties(
+        ln=LineProperties(solidFill="000000")
+    )
+    #chart.x_axis.txPr = RichText(
+    #    p=[
+    #        Paragraph(
+    #            pPr=ParagraphProperties(
+    #                defRPr=CharacterProperties(sz=900)
+    #            )
+    #        )
+    #    ]
+    #)
+    
+    # Configure y-axis title (bold)
+    chart.y_axis.title = y_axis_title
+    yrt = chart.y_axis.title.tx.rich
+    ypara = yrt.p[0]
+    yrun = ypara.r[0]
+    yrun.rPr = CharacterProperties(
+        sz=1100,
+        b=True
+    )
+    chart.y_axis.delete = False
+    chart.y_axis.tickLblPos = "low"
+    chart.y_axis.crosses = 'autoZero'
+    chart.y_axis.scaling.min = 0  # Start at 0
+
+    chart.y_axis.spPr = GraphicalProperties(
+        ln=LineProperties(solidFill="000000")
+    )
+    
+    # Set titles for each series with different colors
+    # Color palette for different series
+    colors = [
+        '5B9BD5',  # Light Blue
+        '70AD47',  # Green
+        'FF6B6B',  # Red
+        '9B59B6',  # Purple
+        '3498DB',  # Cyan
+        'E67E22',  # Dark Orange
+        '2ECC71',  # Emerald
+        'E74C3C'   # Dark Red
+    ]
+    
+    for idx, col_name in enumerate(dist_df.columns[start_data_col-1:]):
+        series = chart.series[idx]
+        # Create SeriesLabel with the column name
+        series.tx = SeriesLabel(v=col_name)
+        
+        # Set different color for each series
+        color_idx = idx % len(colors)
+        series.graphicalProperties.solidFill = colors[color_idx]
+    
+    # Add data labels - only show value
+    chart.dataLabels = DataLabelList()
+    chart.dataLabels.showVal = True
+    chart.dataLabels.showCatName = False
+    chart.dataLabels.showPercent = False
+    chart.dataLabels.showLegendKey = False
+    chart.dataLabels.showSerName = False
+    chart.dataLabels.position = 'outEnd'  # Outside top
+    
+    # Set data label font (smaller, clean)
+    for series in chart.series:
+        if series.dLbls:
+            series.dLbls.font = DrawingFont(sz=900)  # 9 pt
+    
+    # Add the chart to the sheet
+    dist_sheet.add_chart(chart, chart_position)
+    print(f"    ✓ Added chart at {chart_position} with title '{chart_title}'")
+
+def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_average_row=True):
     """Write dataframe to Excel with proper Excel formulas, average row outside table."""
     if df.empty:
         print(f"    WARNING: DataFrame for '{sheet_name}' is empty, skipping")
@@ -1264,7 +1472,6 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
     for col_name, formulas in formula_info.items():
         if col_name in col_letters:
             col_idx = list(df.columns).index(col_name) + 1
-            col_letter = col_letters[col_name]
             
             for row_idx_in_df, formula_expr in formulas:
                 excel_row = row_idx_in_df + 2
@@ -1293,6 +1500,11 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                             cell = sheet.cell(row=excel_row, column=col_idx)
                             cell.value = formula
                             cell.number_format = "0.000"
+                elif formula_expr.startswith('='):
+                    cell = sheet.cell(row=excel_row, column=col_idx)
+                    cell.value = formula_expr
+                    if 'ratio' in col_name.lower() or 'diff' in col_name.lower():
+                        cell.number_format = "0.000"
     
     # Add average row
     if add_average_row:
@@ -1381,8 +1593,9 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
             
             print(f"    ✓ Added average row at row {avg_row_excel} (outside table)")
     
-    # Write distribution tables with FREQUENCY (spill)
+    # Write distribution tables with FREQUENCY using ArrayFormula
     main_sheet_name = sheet_name
+    main_workbook = writer.book
     
     def format_distribution_sheet(dist_sheet, dist_df):
         """Format distribution sheet with header styling."""
@@ -1405,82 +1618,56 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
             adjusted_width = min(max_length + 2, 30)
             dist_sheet.column_dimensions[column_letter].width = adjusted_width
         
-        dist_sheet.freeze_panes = dist_sheet['A2']    
-   
-    def add_frequency_formulas(dist_sheet, bin_values, data_columns, main_sheet_name, col_letters, data_start_row, data_end_row):
-        """Add FREQUENCY formulas as array formulas using openpyxl.worksheet.formula.ArrayFormula."""
-        # Column A: Bin values
-        bin_col_idx = 1
-        bin_col_letter = get_column_letter(bin_col_idx)
-        
-        # Write bin values in column A (starting from row 2)
-        num_bins = len(bin_values)
-        for row_idx, bin_val in enumerate(bin_values):
-            cell = dist_sheet.cell(row=row_idx + 2, column=bin_col_idx)
-            cell.value = bin_val
-        
-        # Bin range: A2:A{N+1}
-        bin_range = f"{bin_col_letter}2:{bin_col_letter}{num_bins + 1}"
-        
-        for col_name in data_columns:
-            if col_name in col_letters:
-                # Find which column this is in the distribution sheet
-                dist_col_idx = None
-                for idx, header in enumerate(dist_sheet[1], 1):
-                    if header.value == col_name:
-                        dist_col_idx = idx
-                        break
-                
-                if dist_col_idx is not None:
-                    main_col_letter = col_letters[col_name]
-                    data_range = f"'{main_sheet_name}'!{main_col_letter}{data_start_row}:{main_col_letter}{data_end_row}"
-                    
-                    # Build the FREQUENCY formula
-                    # FREQUENCY returns N+1 values where N = number of bins
-                    frequency_formula = f"=FREQUENCY({data_range},{bin_range})"
-                    
-                    # Determine the range for the array formula
-                    # We need N+1 rows because FREQUENCY returns N+1 values [citation:10]
-                    start_row = 2
-                    end_row = num_bins + 2  # N+1 values + 1 for header offset
-                    col_letter = get_column_letter(dist_col_idx)
-                    array_range = f"{col_letter}{start_row}:{col_letter}{end_row}"
-                    
-                    # Set the array formula on the FIRST cell of the range only
-                    # This prevents the @ symbol from appearing
-                    first_cell = f"{col_letter}{start_row}"
-                    dist_sheet[first_cell] = ArrayFormula(
-                        ref=array_range,
-                        text=frequency_formula
-                    )
-   
+        dist_sheet.freeze_panes = dist_sheet['A2']
+      
     # Write ratio distribution table
     if df.attrs.get('ratio_distribution') is not None:
         ratio_dist_df = df.attrs['ratio_distribution']
         ratio_bins = df.attrs.get('ratio_bins', [])
         ratio_columns = df.attrs.get('ratio_columns', [])
-        dist_sheet_name = f"{sheet_name[:15]}_ratio_dist"
+        dist_sheet_name = sheet_name.replace("_comparison","_ratio_dist")
         
         ratio_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
         dist_sheet = workbook[dist_sheet_name]
         
         add_frequency_formulas(dist_sheet, ratio_bins, ratio_columns, main_sheet_name, col_letters, data_start_row, data_end_row)
         format_distribution_sheet(dist_sheet, ratio_dist_df)
-        print(f"    ✓ Wrote ratio distribution table to sheet '{dist_sheet_name}' with FREQUENCY (auto-spill)")
+        print(f"    ✓ Wrote ratio distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
+        
+        # Create chart for ratio distribution
+        # Extract Skia version from sheet name or use default
+        chart_title = f"{baseline_version} Nanobench Time Ratio Distribution by Range()"
+        x_title = "Time Ratio Range"
+        y_title = "Count"
+        
+        # Position chart below the data (starting at row after data + 2)
+        chart_start_row = len(ratio_dist_df) + 5
+        chart_position = f"C{chart_start_row}"
+        create_distribution_chart(dist_sheet, ratio_dist_df, chart_title, x_title, y_title, chart_position)
     
     # Write diff distribution table
     if df.attrs.get('diff_distribution') is not None:
         diff_dist_df = df.attrs['diff_distribution']
         diff_bins = df.attrs.get('diff_bins', [])
         diff_columns = df.attrs.get('diff_columns', [])
-        dist_sheet_name = f"{sheet_name[:15]}_diff_dist"
+        dist_sheet_name = sheet_name.replace("_comparison", "_diff_dist")
         
         diff_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
         dist_sheet = workbook[dist_sheet_name]
         
         add_frequency_formulas(dist_sheet, diff_bins, diff_columns, main_sheet_name, col_letters, data_start_row, data_end_row)
         format_distribution_sheet(dist_sheet, diff_dist_df)
-        print(f"    ✓ Wrote diff distribution table to sheet '{dist_sheet_name}' with FREQUENCY (auto-spill)")
+        print(f"    ✓ Wrote diff distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
+        
+        # Create chart for diff distribution
+        chart_title = f"{baseline_version} Nanobench Time Diff Distribution by Range()"
+        x_title = "Time Diff Range(ms)"
+        y_title = "Count"
+        
+        # Position chart below the data (starting at row after data + 2)
+        chart_start_row = len(diff_dist_df) + 5
+        chart_position = f"C{chart_start_row}"
+        create_distribution_chart(dist_sheet, diff_dist_df, chart_title, x_title, y_title, chart_position)
     
     return df
 
@@ -1731,7 +1918,7 @@ def main():
                 
                 if not version_df.empty:
                     sheet_name = f"{compare_version}_comparison"[:31]
-                    write_dataframe_with_formulas(writer, sheet_name, version_df)
+                    write_dataframe_with_formulas(writer, sheet_name, version_df, baseline_version)
                     
                     workbook = writer.book
                     sheet = workbook[sheet_name]
@@ -1749,7 +1936,7 @@ def main():
             )
             if cross_version_df is not None and not cross_version_df.empty:
                 # Write the main cross-version comparison
-                write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df)
+                write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df, baseline_version)
                 
                 workbook = writer.book
                 sheet = workbook['cross_version_comparison']
