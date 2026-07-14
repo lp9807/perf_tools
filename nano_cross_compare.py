@@ -47,6 +47,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.comments import Comment
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.formula import ArrayFormula
 from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
@@ -1047,9 +1048,7 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
     
     # Find benchmarks that exist in ALL backends of ALL versions
     all_version_benchmarks = []
-    
     for version_name, version_data in version_groups.items():
-        # Get benchmarks for this version that exist in all backends of this version
         backend_benchmarks = []
         for df in version_data['dataframes'].values():
             backend_benchmarks.append(set(df['bench'].tolist()))
@@ -1057,10 +1056,8 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
         if backend_benchmarks:
             version_common = set.intersection(*backend_benchmarks)
             all_version_benchmarks.append(version_common)
-            print(f"    Version {version_name}: {len(version_common)} common benchmarks out of {len(set.union(*backend_benchmarks))} total")
     
     if all_version_benchmarks:
-        # Find intersection across all versions
         common_benchmarks = set.intersection(*all_version_benchmarks)
         benches = sorted(list(common_benchmarks))
         print(f"    Cross-version common benchmarks: {len(common_benchmarks)} across all versions")
@@ -1071,11 +1068,10 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
         print(f"    WARNING: No common benchmarks found across all versions")
         return pd.DataFrame()
     
-    # Create mapping between full version tag and compare version
+    # Create version mapping
     version_mapping = {}
     for full_tag in version_groups.keys():
         if comparison_type in ["same_skia_different_api", "same_skia_same_api"]:
-            # Extract API part as compare version
             api_match = API_REGEX.search(full_tag)
             if api_match:
                 compare_ver = f"{api_match.group(1).lower()}{api_match.group(2)}"
@@ -1083,7 +1079,6 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
             else:
                 version_mapping[full_tag] = full_tag
         elif comparison_type == "same_api_different_skia":
-            # Extract Skia part as compare version
             skia_match = SKIA_REGEX.search(full_tag)
             if skia_match:
                 compare_ver = f"{skia_match.group(1).lower()}{skia_match.group(2)}"
@@ -1091,10 +1086,7 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
             else:
                 version_mapping[full_tag] = full_tag
         else:
-            # Mixed case - use full tag as is
             version_mapping[full_tag] = full_tag
-    
-    print(f"    Version mapping: {version_mapping}")
     
     # Prepare comparison data
     comparison_data = {
@@ -1102,10 +1094,10 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
         'Bench': benches
     }
     
-    # Track column names for formula references
+    # Track column names
     column_names = {}
     
-    # Add all mean columns using compare version as column name
+    # Add mean columns
     for full_tag, version_data in version_groups.items():
         compare_ver = version_mapping[full_tag]
         backend_mapping = version_data.get('backend_mapping', {})
@@ -1113,18 +1105,15 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
         for col_name, df in sorted(version_data['dataframes'].items()):
             backend = backend_mapping.get(col_name, col_name)
             mean_dict = dict(zip(df['bench'], df['mean']))
-            # Use compare version as part of column name
             display_name = f"{backend}_{compare_ver}"
             comparison_data[display_name] = [mean_dict.get(bench, float('nan')) for bench in benches]
             column_names[display_name] = display_name
     
-    # Add ratio AND diff columns comparing ALL possible pairs of compare versions
-    # Only compare between compare_versions, NOT including baseline
+    # Add ratio and diff columns
     backends = ['grdawn_vk', 'glesdmsaa', 'vkdmsaa', 'grvk']
+    ratio_columns = []
+    diff_columns = []
     
-    print(f"    Generating ratio and diff columns for all compare version pairs...")
-    
-    # Generate pairs only from compare_versions (exclude baseline)
     for i, version1 in enumerate(compare_versions):
         for version2 in compare_versions[i+1:]:
             for backend in backends:
@@ -1132,22 +1121,17 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
                 col2_name = f"{backend}_{version2}"
                 
                 if col1_name in column_names and col2_name in column_names:
-                    # Generate ratio: version1 vs version2
-                    ratio_col_name = f"{backend}_{version1}_vs_{version2}(ratio)"
-                    comparison_data[ratio_col_name] = [f"FORMULA:{col1_name}/{col2_name}"] * len(benches)
-                    print(f"      Added ratio: {ratio_col_name} = {col1_name}/{col2_name}")
+                    config_name = f"{backend}_{version1} vs {backend}_{version2}"
+                    ratio_col = f"{config_name} (ratio)"
+                    diff_col = f"{config_name} (diff)"
                     
-                    # Generate diff: version1 vs version2
-                    diff_col_name = f"{backend}_{version1}_vs_{version2}(diff)"
-                    comparison_data[diff_col_name] = [f"FORMULA:{col1_name}-{col2_name}"] * len(benches)
-                    print(f"      Added diff: {diff_col_name} = {col1_name}-{col2_name}")
-                else:
-                    if col1_name not in column_names:
-                        print(f"      Warning: Missing column {col1_name}")
-                    if col2_name not in column_names:
-                        print(f"      Warning: Missing column {col2_name}")
+                    comparison_data[ratio_col] = [f"FORMULA:{col1_name}/{col2_name}"] * len(benches)
+                    comparison_data[diff_col] = [f"FORMULA:{col1_name}-{col2_name}"] * len(benches)
+                    
+                    ratio_columns.append(ratio_col)
+                    diff_columns.append(diff_col)
     
-    # Add summary columns from existing comparison page if provided
+    # Add summary columns if provided
     if summary_columns:
         for col_name, col_values in summary_columns.items():
             if len(col_values) == len(benches):
@@ -1156,37 +1140,65 @@ def create_cross_version_page(version_groups, all_backends, summary_columns, mis
     # Create DataFrame
     df = pd.DataFrame(comparison_data)
     
-    # Add average row at the end (same as version comparison)
-    if len(df) > 0:
-        # Create a new row with 'AVERAGE' in the Bench column
-        avg_row = {'ID': '', 'Bench': 'AVERAGE'}
+    # Build distribution table data with FREQUENCY formulas
+    if ratio_columns or diff_columns:
+        print(f"\n    Building distribution tables with FREQUENCY...")
         
-        # Calculate average for each column (excluding non-numeric columns)
-        for col in df.columns:
-            if col not in ['ID', 'Bench']:
-                # Try to convert to numeric, if fails, leave as empty string
-                try:
-                    # Check if column contains formula placeholders
-                    if df[col].dtype == 'object' and len(df) > 0:
-                        first_val = df[col].iloc[0]
-                        if isinstance(first_val, str) and first_val.startswith('FORMULA:'):
-                            # For formula columns, skip average (formulas can't be averaged as strings)
-                            avg_row[col] = ''
-                            continue
-                    
-                    # Convert column to numeric, coercing errors to NaN
-                    numeric_values = pd.to_numeric(df[col], errors='coerce')
-                    if not numeric_values.isna().all():
-                        # Calculate mean, ignoring NaN
-                        avg_value = numeric_values.mean()
-                        avg_row[col] = avg_value
-                    else:
-                        avg_row[col] = ''
-                except:
-                    avg_row[col] = ''
+        # Ratio distribution bins: (value, label)
+        ratio_bins = [
+            (0.1, '[0, 0.1]'),
+            (0.2, '(0.1, 0.2]'),
+            (0.5, '(0.2, 0.5]'),
+            (1.0, '(0.5, 1.0]'),
+            (5.0, '(1.0, 5.0]'),
+            (10.0, '(5.0, 10.0]'),
+            (float('inf'), '>10')
+        ]
         
-        # Append the average row to the DataFrame
-        df = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
+        # Diff distribution bins: (value, label)
+        diff_bins = [
+            (-10.0, '<-10'),
+            (-5.0, '[-10, -5)'),
+            (-1.0, '[-5, -1)'),
+            (-0.5, '[-1, -0.5)'),
+            (0.0, '[-0.5, 0)'),
+            (1.0, '[0, 1]'),
+            (float('inf'), '>1')
+        ]
+        
+        # Build ratio distribution table
+        if ratio_columns:
+            # Only store bin labels and values - no formula placeholders for each cell
+            ratio_dist_data = {
+                'Bin': [threshold for threshold, _ in ratio_bins if threshold != float('inf')] + [''],
+                'Label': [label for _, label in ratio_bins]
+            }
+            
+            # Add empty columns for each ratio column (will be filled with FREQUENCY formula in first cell)
+            for col in ratio_columns:
+                ratio_dist_data[col] = [''] * len(ratio_bins)
+            
+            ratio_dist_df = pd.DataFrame(ratio_dist_data)
+            df.attrs['ratio_distribution'] = ratio_dist_df
+            df.attrs['ratio_bins'] = [threshold for threshold, _ in ratio_bins if threshold != float('inf')]
+            df.attrs['ratio_columns'] = ratio_columns
+            print(f"    ✓ Created ratio distribution table with {len(ratio_bins)} bins and {len(ratio_columns)} columns")
+        
+        # Build diff distribution table
+        if diff_columns:
+            diff_dist_data = {
+                'Bin': [threshold for threshold, _ in diff_bins if threshold != float('inf')] + [''],
+                'Label': [label for _, label in diff_bins]
+            }
+            
+            for col in diff_columns:
+                diff_dist_data[col] = [''] * len(diff_bins)
+            
+            diff_dist_df = pd.DataFrame(diff_dist_data)
+            df.attrs['diff_distribution'] = diff_dist_df
+            df.attrs['diff_bins'] = [threshold for threshold, _ in diff_bins if threshold != float('inf')]
+            df.attrs['diff_columns'] = diff_columns
+            print(f"    ✓ Created diff distribution table with {len(diff_bins)} bins and {len(diff_columns)} columns")
     
     return df
 
@@ -1205,7 +1217,6 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
         if last_val == 'AVERAGE':
             has_average_in_data = True
             avg_data = df.iloc[-1].to_dict()
-            # Remove the average row from the dataframe
             df = df.iloc[:-1]
             print(f"    Found average row in dataframe - will preserve it")
     
@@ -1234,7 +1245,7 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                 for idx, _ in col_formulas:
                     df_for_write[col].iloc[idx] = None
     
-    # Write to Excel
+    # Write the main dataframe
     df_for_write.to_excel(writer, sheet_name=sheet_name, index=False)
     
     workbook = writer.book
@@ -1246,11 +1257,15 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
         col_letters[col_name] = get_column_letter(idx)
     
     last_data_row = len(df) + 1
+    data_start_row = 2
+    data_end_row = last_data_row - 1
     
-    # Add formulas
+    # Add formulas to main sheet
     for col_name, formulas in formula_info.items():
         if col_name in col_letters:
             col_idx = list(df.columns).index(col_name) + 1
+            col_letter = col_letters[col_name]
+            
             for row_idx_in_df, formula_expr in formulas:
                 excel_row = row_idx_in_df + 2
                 
@@ -1278,28 +1293,19 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                             cell = sheet.cell(row=excel_row, column=col_idx)
                             cell.value = formula
                             cell.number_format = "0.000"
-                elif formula_expr.startswith('='):
-                    cell = sheet.cell(row=excel_row, column=col_idx)
-                    cell.value = formula_expr
-                    if 'ratio' in col_name.lower() or 'diff' in col_name.lower():
-                        cell.number_format = "0.000"
     
-    # Add average row (single source of truth)
+    # Add average row
     if add_average_row:
-        # If no average data exists, calculate it
         if not has_average_in_data or avg_data is None:
             print(f"    No existing average row - calculating new one")
             avg_data = {}
             for col_name in df.columns:
                 if col_name not in ['ID', 'Bench']:
-                    # Check if this column should have an average
                     should_have_average = False
                     
-                    # Check formula columns
                     if col_name in formula_info:
                         should_have_average = True
                     else:
-                        # Check numeric values
                         for val in df[col_name].head(5):
                             if val is not None:
                                 try:
@@ -1322,7 +1328,6 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
             has_average_in_data = True
             print(f"    ✓ Calculated new average row")
         
-        # Write the average row
         if has_average_in_data and avg_data:
             avg_row_excel = last_data_row + 2
             
@@ -1375,6 +1380,107 @@ def write_dataframe_with_formulas(writer, sheet_name, df, add_average_row=True):
                         cell.alignment = Alignment(horizontal='center', vertical='center')
             
             print(f"    ✓ Added average row at row {avg_row_excel} (outside table)")
+    
+    # Write distribution tables with FREQUENCY (spill)
+    main_sheet_name = sheet_name
+    
+    def format_distribution_sheet(dist_sheet, dist_df):
+        """Format distribution sheet with header styling."""
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        for cell in dist_sheet[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        for column in dist_sheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 30)
+            dist_sheet.column_dimensions[column_letter].width = adjusted_width
+        
+        dist_sheet.freeze_panes = dist_sheet['A2']    
+   
+    def add_frequency_formulas(dist_sheet, bin_values, data_columns, main_sheet_name, col_letters, data_start_row, data_end_row):
+        """Add FREQUENCY formulas as array formulas using openpyxl.worksheet.formula.ArrayFormula."""
+        # Column A: Bin values
+        bin_col_idx = 1
+        bin_col_letter = get_column_letter(bin_col_idx)
+        
+        # Write bin values in column A (starting from row 2)
+        num_bins = len(bin_values)
+        for row_idx, bin_val in enumerate(bin_values):
+            cell = dist_sheet.cell(row=row_idx + 2, column=bin_col_idx)
+            cell.value = bin_val
+        
+        # Bin range: A2:A{N+1}
+        bin_range = f"{bin_col_letter}2:{bin_col_letter}{num_bins + 1}"
+        
+        for col_name in data_columns:
+            if col_name in col_letters:
+                # Find which column this is in the distribution sheet
+                dist_col_idx = None
+                for idx, header in enumerate(dist_sheet[1], 1):
+                    if header.value == col_name:
+                        dist_col_idx = idx
+                        break
+                
+                if dist_col_idx is not None:
+                    main_col_letter = col_letters[col_name]
+                    data_range = f"'{main_sheet_name}'!{main_col_letter}{data_start_row}:{main_col_letter}{data_end_row}"
+                    
+                    # Build the FREQUENCY formula
+                    # FREQUENCY returns N+1 values where N = number of bins
+                    frequency_formula = f"=FREQUENCY({data_range},{bin_range})"
+                    
+                    # Determine the range for the array formula
+                    # We need N+1 rows because FREQUENCY returns N+1 values [citation:10]
+                    start_row = 2
+                    end_row = num_bins + 2  # N+1 values + 1 for header offset
+                    col_letter = get_column_letter(dist_col_idx)
+                    array_range = f"{col_letter}{start_row}:{col_letter}{end_row}"
+                    
+                    # Set the array formula on the FIRST cell of the range only
+                    # This prevents the @ symbol from appearing
+                    first_cell = f"{col_letter}{start_row}"
+                    dist_sheet[first_cell] = ArrayFormula(
+                        ref=array_range,
+                        text=frequency_formula
+                    )
+   
+    # Write ratio distribution table
+    if df.attrs.get('ratio_distribution') is not None:
+        ratio_dist_df = df.attrs['ratio_distribution']
+        ratio_bins = df.attrs.get('ratio_bins', [])
+        ratio_columns = df.attrs.get('ratio_columns', [])
+        dist_sheet_name = f"{sheet_name[:15]}_ratio_dist"
+        
+        ratio_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+        dist_sheet = workbook[dist_sheet_name]
+        
+        add_frequency_formulas(dist_sheet, ratio_bins, ratio_columns, main_sheet_name, col_letters, data_start_row, data_end_row)
+        format_distribution_sheet(dist_sheet, ratio_dist_df)
+        print(f"    ✓ Wrote ratio distribution table to sheet '{dist_sheet_name}' with FREQUENCY (auto-spill)")
+    
+    # Write diff distribution table
+    if df.attrs.get('diff_distribution') is not None:
+        diff_dist_df = df.attrs['diff_distribution']
+        diff_bins = df.attrs.get('diff_bins', [])
+        diff_columns = df.attrs.get('diff_columns', [])
+        dist_sheet_name = f"{sheet_name[:15]}_diff_dist"
+        
+        diff_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+        dist_sheet = workbook[dist_sheet_name]
+        
+        add_frequency_formulas(dist_sheet, diff_bins, diff_columns, main_sheet_name, col_letters, data_start_row, data_end_row)
+        format_distribution_sheet(dist_sheet, diff_dist_df)
+        print(f"    ✓ Wrote diff distribution table to sheet '{dist_sheet_name}' with FREQUENCY (auto-spill)")
     
     return df
 
@@ -1488,7 +1594,7 @@ def backup_original_sheets(writer, all_original_sheets):
         
         print(f"  ✓ Backed up '{sheet_name}' -> sheet '{final_sheet_name}' ({len(df)} rows)")
 
-def print_summary(draw_types_maps, version_groups, 
+def print_summary(version_groups, 
                   output_file, version_num, all_original_sheets, summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
                   missing_backends, single_version_backends, baseline_version, 
@@ -1589,16 +1695,13 @@ def main():
      compare_versions, comparison_type, summary_columns_by_version, 
      has_comparison_page) = read_multiple_excel_files(excel_files)
     
-    # Get unique benches for JSON analysis
+    # Get unique benches
     all_benches = set()
     for df in all_dataframes.values():
         all_benches.update(df['bench'].tolist())
     print(f"\n📋 Found {len(all_benches)} unique benchmarks")
     
-    # Analyze ftrace files (if folders provided)
-    draw_types_maps = []
-    
-    # Generate output filename with baseline version
+    # Generate output filename
     output_file, version_num = generate_output_filename(baseline_version)
     
     # Write to Excel
@@ -1607,7 +1710,6 @@ def main():
         
         # Create comparison pages for each compare version
         for compare_version in compare_versions:
-            # Find the full version that contains this compare version
             full_version = None
             for v in version_groups.keys():
                 if compare_version in v:
@@ -1619,7 +1721,6 @@ def main():
                 version_data = version_groups[full_version]
                 missing_for_version = missing_report.get(full_version, set())
                 
-                # Use version-specific summary columns if available
                 version_summary = version_data.get('summary_columns', primary_summary_columns)
                 
                 version_df = create_version_comparison_page(
@@ -1639,7 +1740,7 @@ def main():
                 else:
                     print(f"    ✗ Skipping '{compare_version}_comparison' - no common benchmarks found")
         
-        # Create cross-version comparison page if multiple versions AND different versions exist
+        # Create cross-version comparison page
         if len(version_groups) > 1 and comparison_type != "same_skia_same_api":
             print(f"\n  Creating cross-version comparison page")
             cross_version_df = create_cross_version_page(
@@ -1647,12 +1748,15 @@ def main():
                 version_benchmarks, baseline_version, compare_versions, comparison_type
             )
             if cross_version_df is not None and not cross_version_df.empty:
+                # Write the main cross-version comparison
                 write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df)
                 
                 workbook = writer.book
                 sheet = workbook['cross_version_comparison']
                 apply_table_formatting_to_sheet(sheet, cross_version_df)
                 print(f"    ✓ Created 'cross_version_comparison' with {len(cross_version_df)} benchmarks, {len(cross_version_df.columns)} columns")
+                
+                # Distribution tables are automatically written by write_dataframe_with_formulas
             else:
                 print(f"    ✗ Skipping 'cross_version_comparison' - no common benchmarks across all versions")
         else:
@@ -1664,8 +1768,8 @@ def main():
         # Backup original backend sheets
         backup_original_sheets(writer, all_original_sheets)
     
-    # Print summary - now with comparison_type
-    print_summary(draw_types_maps, version_groups, 
+    # Print summary
+    print_summary(version_groups, 
                   output_file, version_num, all_original_sheets, primary_summary_columns, 
                   missing_report, unique_benchmarks, duplicate_report, 
                   missing_backends, single_version_backends, baseline_version, 
