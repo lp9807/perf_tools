@@ -115,20 +115,166 @@ def handle_duplicate_benchmarks(df, csv_file):
     return df, warnings_list
 
 def read_csv_files(csv_files):
-    """Read CSV files, validate columns, and detect duplicate benchmarks."""
+    """Read CSV files, validate columns, filter invalid rows, and detect duplicate benchmarks.
+    Handles cases where the first rows might be invalid by searching for the header row.
+    """
     dataframes = {}
     all_warnings = []
     
     for csv_file in csv_files:
         try:
-            df = pd.read_csv(csv_file)
+            # Read the entire file as raw text first
+            with open(csv_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
             
-            # Check required columns
-            if 'bench' not in df.columns or 'mean' not in df.columns:
-                print(f"Error: CSV file '{csv_file}' must contain 'bench' and 'mean' columns")
+            if not lines:
+                print(f"Error: CSV file '{csv_file}' is empty")
                 sys.exit(1)
             
-            # Check for and handle duplicate benchmarks
+            # Find the row that contains both 'bench' and 'mean' (case-insensitive)
+            header_line_idx = None
+            header_line = None
+            for idx, line in enumerate(lines):
+                line_lower = line.lower()
+                if 'bench' in line_lower and 'mean' in line_lower:
+                    header_line_idx = idx
+                    header_line = line
+                    break
+            
+            if header_line_idx is None:
+                print(f"Error: CSV file '{csv_file}' does not contain a row with both 'bench' and 'mean' columns")
+                print(f"   First few lines of the file:")
+                for idx, line in enumerate(lines[:5]):
+                    print(f"   Line {idx}: {line.strip()}")
+                sys.exit(1)
+            
+            # Try to detect delimiter from the header line
+            possible_delimiters = [',', ';', '\t', '|']
+            detected_delimiter = None
+            
+            for delimiter in possible_delimiters:
+                if delimiter in header_line:
+                    # Count occurrences of this delimiter in the header line
+                    count = header_line.count(delimiter)
+                    if count > 0:
+                        detected_delimiter = delimiter
+                        break
+            
+            if detected_delimiter is None:
+                # If no delimiter detected, try comma as default
+                detected_delimiter = ','
+                print(f"   ⚠️  Could not detect delimiter, using comma as default")
+            
+            # Parse the CSV from the header line onward using the detected delimiter
+            import csv
+            from io import StringIO
+            
+            # Join lines from header onward
+            content = ''.join(lines[header_line_idx:])
+            
+            # Read with detected delimiter
+            try:
+                df = pd.read_csv(StringIO(content), sep=detected_delimiter)
+            except Exception as e:
+                # If that fails, try using Python's csv module to be more flexible
+                print(f"   ⚠️  pandas read failed with delimiter '{detected_delimiter}', trying csv module...")
+                
+                # Parse with csv module to handle varying column counts
+                csv_reader = csv.reader(StringIO(content), delimiter=detected_delimiter)
+                rows = list(csv_reader)
+                
+                if not rows:
+                    print(f"Error: No data rows found in '{csv_file}'")
+                    sys.exit(1)
+                
+                # First row is header
+                header = rows[0]
+                # Filter out empty column names
+                header = [col.strip() for col in header if col.strip()]
+                
+                # Create DataFrame from remaining rows
+                data_rows = []
+                for row in rows[1:]:
+                    # Ensure row has at least as many columns as header
+                    if len(row) >= len(header):
+                        # Take only the columns we need (first len(header) columns)
+                        data_rows.append(row[:len(header)])
+                    else:
+                        # Pad with empty strings if row is too short
+                        padded_row = row + [''] * (len(header) - len(row))
+                        data_rows.append(padded_row[:len(header)])
+                
+                df = pd.DataFrame(data_rows, columns=header)
+            
+            # Check required columns (case-insensitive)
+            # Rename columns to standard names if they differ in case
+            column_mapping = {}
+            for col in df.columns:
+                col_lower = col.lower().strip()
+                if col_lower == 'bench':
+                    column_mapping[col] = 'bench'
+                elif col_lower == 'mean':
+                    column_mapping[col] = 'mean'
+            
+            # Rename columns if needed
+            if column_mapping:
+                df = df.rename(columns=column_mapping)
+            
+            # Verify required columns exist after renaming
+            if 'bench' not in df.columns or 'mean' not in df.columns:
+                print(f"Error: CSV file '{csv_file}' must contain 'bench' and 'mean' columns")
+                print(f"   Found columns: {list(df.columns)}")
+                print(f"   Header row found at line {header_line_idx + 1}: {header_line.strip()}")
+                sys.exit(1)
+            
+            # Remove any rows that might be metadata before the header (they become NaN)
+            # Drop rows where both bench and mean are NaN
+            df = df.dropna(subset=['bench', 'mean'], how='all')
+            
+            # Store original row count for reporting
+            original_row_count = len(df)
+            
+            # Filter out invalid rows
+            invalid_rows_count = 0
+            
+            # Filter 1: Remove rows with empty bench
+            empty_bench_mask = df['bench'].isna() | (df['bench'].astype(str).str.strip() == '')
+            empty_bench_count = empty_bench_mask.sum()
+            if empty_bench_count > 0:
+                invalid_rows_count += empty_bench_count
+                df = df[~empty_bench_mask]
+                print(f"   - Removed {empty_bench_count} rows with empty benchmark name")
+            
+            # Filter 2: Remove rows with empty or non-numeric mean values
+            # First, convert to string to check for emptiness
+            mean_str = df['mean'].astype(str).str.strip()
+            empty_mean_mask = (df['mean'].isna()) | (mean_str == '') | (mean_str == 'nan') | (mean_str == 'None')
+            empty_mean_count = empty_mean_mask.sum()
+            if empty_mean_count > 0:
+                invalid_rows_count += empty_mean_count
+                df = df[~empty_mean_mask]
+                print(f"   - Removed {empty_mean_count} rows with empty mean values")
+            
+            # Filter 3: Remove rows where mean is not a valid number
+            # Try to convert to numeric, coercing errors to NaN
+            df['mean'] = pd.to_numeric(df['mean'], errors='coerce')
+            non_numeric_mask = df['mean'].isna()
+            non_numeric_count = non_numeric_mask.sum()
+            if non_numeric_count > 0:
+                invalid_rows_count += non_numeric_count
+                df = df[~non_numeric_mask]
+                print(f"   - Removed {non_numeric_count} rows with non-numeric mean values")
+            
+            # Report filtering results
+            if invalid_rows_count > 0:
+                print(f"   📊 {csv_file}: Filtered out {invalid_rows_count} invalid rows (kept {len(df)} of {original_row_count})")
+            else:
+                print(f"   ✅ {csv_file}: All {len(df)} rows are valid")
+            
+            # Reset index after filtering
+            df = df.reset_index(drop=True)
+            
+            # Check for and handle duplicate benchmarks (only on valid rows)
             df, warnings = handle_duplicate_benchmarks(df, csv_file)
             if warnings:
                 all_warnings.extend(warnings)
@@ -137,6 +283,8 @@ def read_csv_files(csv_files):
             
         except Exception as e:
             print(f"Error reading CSV file '{csv_file}': {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     
     # Print summary of all duplicate warnings
@@ -154,7 +302,9 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     folder = Path(folder_path)
     draw_types_map = {}
     
-    # Pattern to match SurfaceDrawContext::draw* functions
+    # Pattern to match addDrawOp events (count as one draw)
+    add_draw_op_pattern = re.compile(r'SurfaceDrawContext::addDrawOp')
+    # Pattern to match parent draw functions (determine draw type)
     draw_pattern = re.compile(r'SurfaceDrawContext::draw([a-zA-Z]+)')
     # Pattern to match flush events
     flush_pattern = re.compile(r'sk_gpu_test::TestContext::flushAndWaitOnSync')
@@ -171,8 +321,10 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                 
                 # State: current_submission (dict with draw_types list)
                 state = [None]  # None or dict with 'draw_types' list
+                # Track parent draw type for current context
+                current_draw_type = [None]
                 
-                def process_trace(trace_data):
+                def process_trace(trace_data, parent_func=None):
                     if isinstance(trace_data, dict):
                         func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
                         
@@ -187,20 +339,50 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                                 state[0] = {
                                     'draw_types': []
                                 }
+                                # Reset current draw type
+                                current_draw_type[0] = None
                             else:
-                                # Check for draw events (only if we're inside a submission)
+                                # Check for draw parent function (sets the draw type context)
                                 draw_match = draw_pattern.search(func_name)
-                                if draw_match and state[0] is not None:
+                                if draw_match:
+                                    # This is a draw function that acts as parent
                                     draw_type = draw_match.group(1)
-                                    state[0]['draw_types'].append(draw_type)
+                                    current_draw_type[0] = draw_type
+                                    
+                                    # If we're not in a submission yet, create one
+                                    if state[0] is None:
+                                        state[0] = {
+                                            'draw_types': []
+                                        }
+                                
+                                # Check for addDrawOp event (count as one draw)
+                                if add_draw_op_pattern.search(func_name):
+                                    # We're inside a draw operation
+                                    if state[0] is not None:
+                                        # If we have a current draw type from parent, use it
+                                        if current_draw_type[0] is not None:
+                                            state[0]['draw_types'].append(current_draw_type[0])
+                                        else:
+                                            # No parent draw type found, try to find it in ancestors
+                                            # Check if any parent in the call stack is a draw function
+                                            if parent_func and draw_pattern.search(parent_func):
+                                                draw_match = draw_pattern.search(parent_func)
+                                                if draw_match:
+                                                    draw_type = draw_match.group(1)
+                                                    state[0]['draw_types'].append(draw_type)
+                                                else:
+                                                    state[0]['draw_types'].append('Unknown')
+                                            else:
+                                                state[0]['draw_types'].append('Unknown')
                         
-                        # Recursively process nested structures
-                        for value in trace_data.values():
+                        # Recursively process nested structures with parent context
+                        for key, value in trace_data.items():
                             if isinstance(value, (dict, list)):
-                                process_trace(value)
+                                # Pass the current function name as parent context
+                                process_trace(value, func_name)
                     elif isinstance(trace_data, list):
                         for item in trace_data:
-                            process_trace(item)
+                            process_trace(item, parent_func)
                 
                 # Start processing with initial state
                 process_trace(data)
@@ -223,7 +405,6 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                         type_counts = {}
                         for dt in draw_types:
                             type_counts[dt] = type_counts.get(dt, 0) + 1
-                        
                         
                         # Create a config key from sorted type counts
                         sorted_types = sorted(type_counts.items())
