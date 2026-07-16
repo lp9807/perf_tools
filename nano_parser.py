@@ -427,21 +427,28 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                     # Build summary parts
                     summary_parts = []
                     
-                    # Format ALL configs as sub#id: N[summary]
+                    # Format ALL configs with unified format
                     for idx, (config_key, data) in enumerate(sorted_configs):
                         draw_count = data['draw_count']
                         count = data['count']
                         type_counts = data['type_counts']
                         
-                        # Format the draw type summary
+                        # Build summary parts inner with draw type:count format
+                        summary_parts_inner = []
                         if type_counts:
                             sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
-                            summary = ','.join([f"{t}:{c}" for t, c in sorted_types])
-                        else:
-                            summary = "empty"
+                            for draw_type, cnt in sorted_types:
+                                summary_parts_inner.append(f"{draw_type}:{cnt}")
                         
-                        # All configs use sub#id format
-                        summary_parts.append(f"sub{idx+1}: {count}[{summary}]")
+                        # Build the submission summary string (always report draw count for Ganesh)
+                        if draw_count == 0:
+                            # No draws
+                            summary_part = f"sub{idx+1}({count}):[{draw_count}]"
+                        else:
+                            # Has draws
+                            summary_part = f"sub{idx+1}({count}):[{draw_count}|{','.join(summary_parts_inner)}]"
+                        
+                        summary_parts.append(summary_part)
                     
                     # Join with ", " and add a newline at the end
                     draw_types_map[bench] = ',\n'.join(summary_parts)
@@ -469,6 +476,7 @@ def analyze_ftrace_files_graphite(folder_path, benches):
         sanitized_bench = sanitize_bench_name_for_file(bench)
         json_file = folder / f"{sanitized_bench}.json"
         submissions = []
+        mismatch_count_total = 0
         
         if json_file.exists():
             try:
@@ -542,6 +550,14 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                     for sub in submissions:
                         renderer_count = len(sub['renderers'])
                         draw_count = sub.get('draw_count', 0)
+                        
+                        # Check for mismatch and print error
+                        if renderer_count != draw_count:
+                            mismatch_count_total += 1
+                            # Print error message with details
+                            print(f"    ⚠️  MISMATCH in {bench}: renderer_count ({renderer_count}) != draw_count ({draw_count})")
+                            print(f"        Renderers: {sub['renderers']}")
+                        
                         config_key = f"m{renderer_count}_d{draw_count}"
                         
                         if config_key not in config_groups:
@@ -552,6 +568,10 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                                 'renderers': sub['renderers'][:] if sub['renderers'] else []
                             }
                         config_groups[config_key]['count'] += 1
+                    
+                    # Print summary of mismatches if any
+                    if mismatch_count_total > 0:
+                        print(f"    📊 Total mismatches in {bench}: {mismatch_count_total} submissions")
                     
                     # Sort configs by count descending
                     sorted_configs = sorted(config_groups.items(), key=lambda x: x[1]['count'], reverse=True)
@@ -566,58 +586,37 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                         count = data['count']
                         renderers = data['renderers']
                         
-                        # Check for error condition: rdr < draw
-                        if renderer_count < draw_count:
-                            # Log error message to terminal
-                            print(f"    ERROR in {bench}: renderer_count ({renderer_count}) < draw_count ({draw_count}) for config {config_key} ({count} submissions)")
-                            
-                            # Treat as normal: no flush renderers, all renderers are non-flush
-                            flush_count = 0
-                            flush_renderers = []
-                            non_flush_renderers = renderers
-                        else:
-                            # Normal case: rdr >= draw
-                            flush_count = renderer_count - draw_count
-                            flush_renderers = renderers[:flush_count] if flush_count > 0 else []
-                            non_flush_renderers = renderers[flush_count:] if flush_count > 0 else renderers
+                        # Count renderers with their frequencies
+                        renderer_counts = {}
+                        for r in renderers:
+                            renderer_counts[r] = renderer_counts.get(r, 0) + 1
                         
-                        # Count non-flush renderers
-                        non_flush_counts = {}
-                        for r in non_flush_renderers:
-                            non_flush_counts[r] = non_flush_counts.get(r, 0) + 1
-                        
-                        # Count flush renderers
-                        flush_counts = {}
-                        for r in flush_renderers:
-                            flush_counts[r] = flush_counts.get(r, 0) + 1
-                        
-                        # Build the summary string
+                        # Build summary parts inner with name:count format
                         summary_parts_inner = []
+                        if renderer_counts:
+                            sorted_renderers = sorted(renderer_counts.items(), key=lambda x: x[1], reverse=True)
+                            for name, cnt in sorted_renderers:
+                                summary_parts_inner.append(f"{name}:{cnt}")
                         
-                        # Format non-flush renderers if they exist
-                        if non_flush_counts:
-                            sorted_non_flush = sorted(non_flush_counts.items(), key=lambda x: x[1], reverse=True)
-                            r_summary = ','.join([f"{name}:{cnt}" for name, cnt in sorted_non_flush])
-                            summary_parts_inner.append(r_summary)
-                        
-                        # Add flush renderers with "f:" prefix
-                        if flush_counts:
-                            sorted_flush = sorted(flush_counts.items(), key=lambda x: x[1], reverse=True)
-                            f_summary = ','.join([f"f:{name}:{cnt}" for name, cnt in sorted_flush])
-                            summary_parts_inner.append(f_summary)
-                        
-                        # Special case: no renderers at all
-                        if not summary_parts_inner:
-                            summary = f"{renderer_count}rdr"
+                        # Build the submission summary string
+                        if renderer_count == 0:
+                            # No renderers - only report count
+                            if renderer_count == draw_count:
+                                # Renderer count matches draw count
+                                summary_part = f"sub{idx+1}({count}):[{renderer_count}]"
+                            else:
+                                # Renderer count doesn't match draw count
+                                summary_part = f"sub{idx+1}({count}):[{renderer_count}({draw_count})]"
                         else:
-                            summary = '|'.join(summary_parts_inner)
+                            # Has renderers
+                            if renderer_count == draw_count:
+                                # Renderer count matches draw count
+                                summary_part = f"sub{idx+1}({count}):[{renderer_count}|{','.join(summary_parts_inner)}]"
+                            else:
+                                # Renderer count doesn't match draw count
+                                summary_part = f"sub{idx+1}({count}):[{renderer_count}({draw_count})|{','.join(summary_parts_inner)}]"
                         
-                        # Append draw_count if it's an error case (rdr < draw)
-                        if renderer_count < draw_count:
-                            summary = f"{summary}|draw:{draw_count}"
-                        
-                        # All configs use sub#id format
-                        summary_parts.append(f"sub{idx+1}: {count}[{summary}]")
+                        summary_parts.append(summary_part)
                     
                     # Join with ", " and add a newline at the end
                     draw_types_map[bench] = ',\n'.join(summary_parts)
