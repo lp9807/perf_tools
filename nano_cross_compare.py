@@ -882,10 +882,342 @@ def read_multiple_excel_files(excel_files):
             single_version_backends, version_benchmarks, baseline_version, 
             compare_versions, comparison_type, summary_columns_by_version, has_comparison_page)
 
-def add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name):
+def parse_summary_column(summary_data):
+    """
+    Parse summary column string format: 
+    sub{idx}({sub_count}):[{draw_count}({mismatch_count})|{draw_type:type_count,...}]
+    
+    Multiple sub-entries can be separated by ',' or '\n'.
+    Returns a list of draw type entries with their counts and weights.
+    """
+    draw_types = {}
+    
+    for entry in summary_data:
+        if not isinstance(entry, str) or not entry.startswith('sub'):
+            continue
+        
+        try:
+            # Split multiple sub-entries by comma or newline
+            # But carefully avoid splitting draw type pairs
+            entry_cleaned = entry.replace('\n', ',')
+            
+            # Use a more sophisticated approach to split sub-entries
+            # Find all 'sub' occurrences and split by them
+            sub_entries = []
+            current_pos = 0
+            
+            # Find all positions where 'sub' appears
+            sub_positions = []
+            for match in re.finditer(r'sub\d+\(', entry_cleaned):
+                sub_positions.append(match.start())
+            
+            # If no sub positions found, return
+            if not sub_positions:
+                continue
+            
+            # Extract each sub-entry
+            for i, pos in enumerate(sub_positions):
+                if i < len(sub_positions) - 1:
+                    # Extract from this sub to the next sub
+                    next_pos = sub_positions[i + 1]
+                    sub_entry = entry_cleaned[pos:next_pos].strip()
+                else:
+                    # Last sub-entry goes to the end
+                    sub_entry = entry_cleaned[pos:].strip()
+                
+                if sub_entry.startswith('sub'):
+                    sub_entries.append(sub_entry)
+            
+            if not sub_entries:
+                continue
+            
+            # First pass: calculate total sub_count
+            total_sub_count = 0
+            for sub_entry in sub_entries:
+                sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+                if sub_match:
+                    total_sub_count += int(sub_match.group(1))
+            
+            if total_sub_count == 0:
+                continue
+            
+            # Second pass: parse each sub-entry
+            for sub_entry in sub_entries:
+                # Extract sub_count
+                sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+                if not sub_match:
+                    continue
+                sub_count = int(sub_match.group(1))
+                
+                # Extract draw data part after colon
+                draw_part = sub_entry.split(':', 1)[1] if ':' in sub_entry else ''
+                
+                # Extract draw_count and optional mismatch_count
+                draw_count_match = re.search(r'\[(\d+)\((\d+)\)\|', draw_part)
+                if draw_count_match:
+                    draw_count = int(draw_count_match.group(1))
+                    mismatch_count = int(draw_count_match.group(2))
+                else:
+                    # No mismatch count
+                    draw_count_match = re.search(r'\[(\d+)\|', draw_part)
+                    if not draw_count_match:
+                        continue
+                    draw_count = int(draw_count_match.group(1))
+                    mismatch_count = 0
+                
+                # Extract draw_type:count pairs
+                draw_data = draw_part.split('|', 1)[1] if '|' in draw_part else ''
+                
+                # Remove the trailing ']' if present
+                if draw_data.endswith(']'):
+                    draw_data = draw_data[:-1]
+                
+                if not draw_data:
+                    continue
+                
+                # Parse draw_type:count pairs (comma separated)
+                pairs = draw_data.split(',')
+                for pair in pairs:
+                    pair = pair.strip()
+                    if ':' in pair:
+                        draw_type, count_str = pair.split(':', 1)
+                        draw_type = draw_type.strip()
+                        count_str = count_str.strip()
+                        try:
+                            count = int(count_str)
+                            
+                            # Calculate weight: (type_count/draw_count) * (sub_count/total_sub_count)
+                            if draw_type not in draw_types:
+                                draw_types[draw_type] = []
+                            draw_types[draw_type].append({
+                                'sub_count': sub_count,
+                                'draw_count': draw_count,
+                                'type_count': count,
+                                'entry': entry
+                            })
+                        except ValueError:
+                            # Skip if count is not a valid integer
+                            continue
+        except Exception as e:
+            # Skip malformed entries
+            continue
+    
+    return draw_types
+
+def calculate_draw_type_weights_for_benchmark(summary_entry, total_sub_count):
+    """
+    Calculate weighted counts for each draw type for a single benchmark entry.
+    Multiple sub-entries can be separated by ',' or '\n'.
+    Returns a dictionary mapping draw_type to weighted count.
+    """
+    if not isinstance(summary_entry, str) or not summary_entry.startswith('sub'):
+        return {}
+    
+    try:
+        # Split multiple sub-entries by comma or newline
+        # But carefully avoid splitting draw type pairs
+        entry_cleaned = summary_entry.replace('\n', '')
+        
+        # Use a more sophisticated approach to split sub-entries
+        # Find all 'sub' occurrences and split by them
+        sub_entries = []
+        current_pos = 0
+        
+        # Find all positions where 'sub' appears
+        sub_positions = []
+        for match in re.finditer(r'sub\d+\(', entry_cleaned):
+            sub_positions.append(match.start())
+        
+        # If no sub positions found, return
+        if not sub_positions:
+            return {}
+        
+        # Extract each sub-entry
+        for i, pos in enumerate(sub_positions):
+            if i < len(sub_positions) - 1:
+                # Extract from this sub to the next sub
+                next_pos = sub_positions[i + 1]
+                sub_entry = entry_cleaned[pos:next_pos-1].strip()
+            else:
+                # Last sub-entry goes to the end
+                sub_entry = entry_cleaned[pos:].strip()
+            
+            if sub_entry.startswith('sub'):
+                sub_entries.append(sub_entry)
+        
+        if not sub_entries:
+            return {}
+        
+        weighted_counts = {}
+        total_sub_count_actual = 0
+        
+        # First pass: calculate total sub_count
+        for sub_entry in sub_entries:
+            sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+            if sub_match:
+                total_sub_count_actual += int(sub_match.group(1))
+        
+        if total_sub_count_actual == 0:
+            return {}
+        
+        # Second pass: calculate weights for each draw type
+        for sub_entry in sub_entries:
+            # Extract sub_count
+            sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+            if not sub_match:
+                continue
+            sub_count = int(sub_match.group(1))
+            
+            # Extract draw data part after colon
+            draw_part = sub_entry.split(':', 1)[1] if ':' in sub_entry else ''
+            
+            # Extract draw_count and optional mismatch_count
+            draw_count_match = re.search(r'\[(\d+)\((\d+)\)\|', draw_part)
+            if draw_count_match:
+                draw_count = int(draw_count_match.group(1))
+                mismatch_count = int(draw_count_match.group(2))
+            else:
+                # No mismatch count
+                draw_count_match = re.search(r'\[(\d+)\|', draw_part)
+                if not draw_count_match:
+                    continue
+                draw_count = int(draw_count_match.group(1))
+                mismatch_count = 0
+            
+            # Extract draw_type:count pairs
+            draw_data = draw_part.split('|', 1)[1] if '|' in draw_part else ''
+            
+            # Remove the trailing ']' if present
+            if draw_data.endswith(']'):
+                draw_data = draw_data[:-1]
+                
+            print(f"parse draw type sequence: {draw_data}")
+            
+            if not draw_data:
+                continue
+            
+            # Parse draw_type:count pairs (comma separated)
+            pairs = draw_data.split(',')
+            for pair in pairs:
+                pair = pair.strip()
+                if ':' in pair:
+                    draw_type, count_str = pair.split(':', 1)
+                    draw_type = draw_type.strip()
+                    count_str = count_str.strip()
+                    try:
+                        count = int(count_str)
+                        # Weight: (type_count/draw_count) * (sub_count/total_sub_count)
+                        if draw_count > 0 and total_sub_count_actual > 0:
+                            weight = (count / draw_count) * (sub_count / total_sub_count_actual)
+                            if draw_type in weighted_counts:
+                                weighted_counts[draw_type] += weight
+                            else:
+                                weighted_counts[draw_type] = weight
+                    except ValueError:
+                        # Skip if count is not a valid integer
+                        continue
+        
+        if weighted_counts:
+            total_weight = sum(weighted_counts.values())
+            tolerance = 1e-9
+            if abs(total_weight - 1.0) > tolerance:
+                print(f"    ⚠️ WARNING: Weighted counts sum to {total_weight:.10f}, expected 1.0")
+                # Normalize to ensure sum equals 1
+        
+        return weighted_counts
+        
+    except Exception as e:
+        return {}
+
+def get_draw_type_data_from_summary(df, summary_columns):
+    """
+    Extract draw type data from summary columns.
+    Multiple sub-entries can be separated by ',' or '\n'.
+    Returns a dictionary mapping:
+    - summary_column_name -> {
+        'backend': backend_name,
+        'data': {benchmark: {draw_type: weighted_count, ...}}
+      }
+    """
+    if not summary_columns:
+        return {}
+    
+    draw_type_data = {}
+    
+    for col_name, col_values in summary_columns.items():
+        # Extract backend name from column name
+        # Column names like "grdawn_vk summary", "glesdmsaa summary", etc.
+        backend_name = col_name.replace(' summary', '').replace(' Summary', '').strip()
+        
+        # Check if this column contains draw data
+        has_draw_data = False
+        for val in col_values[:10]:
+            if isinstance(val, str) and 'sub' in val and ':' in val and '|' in val:
+                has_draw_data = True
+                break
+        
+        if not has_draw_data:
+            continue
+        
+        # Get benchmarks from the df (excluding AVERAGE row)
+        benches = df[df['Bench'] != 'AVERAGE']['Bench'].tolist() if 'Bench' in df.columns else []
+        
+        # Calculate total sub_count for each benchmark
+        bench_data = {}
+        
+        for idx, bench in enumerate(benches):
+            if idx < len(col_values):
+                summary_entry = col_values[idx]
+                if isinstance(summary_entry, str) and 'sub' in summary_entry:
+                    # Calculate total sub_count for this benchmark
+                    # Extract all sub_count values from the entry
+                    # Handle both comma and newline separated sub-entries
+                    entry_cleaned = summary_entry.replace('\n', ',')
+                    
+                    # Find all sub entries
+                    sub_entries = []
+                    sub_positions = []
+                    for match in re.finditer(r'sub\d+\(', entry_cleaned):
+                        sub_positions.append(match.start())
+                    
+                    if sub_positions:
+                        for i, pos in enumerate(sub_positions):
+                            if i < len(sub_positions) - 1:
+                                next_pos = sub_positions[i + 1]
+                                sub_entry = entry_cleaned[pos:next_pos].strip()
+                            else:
+                                sub_entry = entry_cleaned[pos:].strip()
+                            if sub_entry.startswith('sub'):
+                                sub_entries.append(sub_entry)
+                    
+                    if sub_entries:
+                        total_sub_count = 0
+                        for sub_entry in sub_entries:
+                            sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+                            if sub_match:
+                                total_sub_count += int(sub_match.group(1))
+                        
+                        if total_sub_count > 0:
+                            # Calculate weighted counts for each draw type
+                            weighted_counts = calculate_draw_type_weights_for_benchmark(summary_entry, total_sub_count)
+                            if weighted_counts:
+                                bench_data[bench] = weighted_counts
+        
+        if bench_data:
+            draw_type_data[col_name] = {
+                'backend': backend_name,
+                'data': bench_data
+            }
+            print(f"    ✓ Extracted draw type data from '{col_name}' (backend: {backend_name})")
+    
+    return draw_type_data
+
+def add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name, summary_columns=None):
     """
     Add glesdmsaa distribution tables to the DataFrame as attributes.
     This function is used for both imported and generated data.
+    
+    Now includes draw call count distribution for each backend vs glesdmsaa config.
     """
     # ============================================================
     # Create glesdmsaa ratio distribution table
@@ -954,6 +1286,62 @@ def add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_c
         
         print(f"    ✓ Created glesdmsaa diff distribution table with {len(glesdmsaa_diff_bins)} bins and {len(glesdmsaa_diff_cols)} columns")
     
+    # ============================================================
+    # NEW: Create draw call count distribution for grdawn_vk vs glesdmsaa ratio
+    # ============================================================
+    if summary_columns and glesdmsaa_ratio_cols:
+        # Extract draw type data from summary columns
+        draw_type_data = get_draw_type_data_from_summary(df, summary_columns)
+        
+        if draw_type_data:
+            # Process each summary column separately
+            for summary_col, summary_info in draw_type_data.items():
+                backend_name = summary_info['backend']
+                bench_data = summary_info['data']
+                
+                # Find ratio columns for this backend vs glesdmsaa
+                backend_ratio_cols = [col for col in glesdmsaa_ratio_cols 
+                                     if col.startswith(f"grdawn_vk vs glesdmsaa")]
+                
+                if not backend_ratio_cols:
+                    print(f"    ⚠️ No ratio columns found for backend grdawn_vk vs glesdmsaa")
+                    continue
+                
+                # Get all unique draw types
+                all_draw_types = set()
+                for bench_info in bench_data.values():
+                    all_draw_types.update(bench_info.keys())
+                
+                if not all_draw_types:
+                    print(f"    ⚠️ No draw types found for backend '{backend_name}'")
+                    continue
+                
+                print(f"    Found {len(all_draw_types)} draw types for backend '{backend_name}'")
+                
+                # Create draw call distribution table
+                draw_dist_data = {
+                    'Draw_Type': sorted(all_draw_types)
+                }
+                
+                # Add columns for each ratio column (with backend name in column header)
+                for col in backend_ratio_cols:
+                    # Extract the config name without " (ratio)" suffix
+                    config_name = col.replace(' (ratio)', '')
+                    draw_dist_data[config_name] = [''] * len(all_draw_types)
+                
+                draw_dist_df = pd.DataFrame(draw_dist_data)
+                
+                # Store as attributes with backend-specific naming
+                attr_prefix = f"{backend_name}"
+                df.attrs[f'{attr_prefix}_draw_distribution'] = draw_dist_df
+                df.attrs[f'{attr_prefix}_draw_columns'] = backend_ratio_cols
+                df.attrs[f'{attr_prefix}_draw_data'] = bench_data
+                df.attrs[f'{attr_prefix}_draw_backend'] = backend_name
+                
+                print(f"    ✓ Created draw call distribution table for backend '{backend_name}' with {len(all_draw_types)} draw types and {len(backend_ratio_cols)} columns")
+        else:
+            print(f"    ⚠️ No draw type data available from summary columns")
+    
     return df
 
 def create_version_comparison_page(version_data, version_name,
@@ -1005,7 +1393,8 @@ def create_version_comparison_page(version_data, version_name,
                 imported_df = add_glesdmsaa_distribution_tables(imported_df, 
                                                                 glesdmsaa_ratio_cols, 
                                                                 glesdmsaa_diff_cols,
-                                                                version_name)
+                                                                version_name,
+                                                                version_summary_columns)
             
             return imported_df
         else:
@@ -1146,7 +1535,7 @@ def create_version_comparison_page(version_data, version_name,
     # ============================================================
     # Add glesdmsaa distribution tables (for generated data)
     # ============================================================
-    df = add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name)
+    df = add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name, version_summary_columns)
     
     # Add average row at the end
     if len(df) > 0:
@@ -1854,6 +2243,67 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         chart_start_row = len(glesdmsaa_diff_dist_df) + 5
         chart_position = f"C{chart_start_row}"
         create_distribution_chart(dist_sheet, glesdmsaa_diff_dist_df, chart_title, x_title, y_title, chart_position)
+        
+    # ============================================================
+    # NEW: Write draw call distribution tables for each backend
+    # ============================================================
+    # Find all draw distribution attributes
+    # Look for attributes ending with '_draw_distribution'
+    draw_attrs = [key for key in df.attrs.keys() if key.endswith('_draw_distribution')]
+    
+    for draw_attr in draw_attrs:
+        # Extract backend name from attribute (remove '_draw_distribution' suffix)
+        backend_name = draw_attr.replace('_draw_distribution', '')
+        
+        # Get the distribution data
+        draw_dist_df = df.attrs.get(draw_attr)
+        draw_columns = df.attrs.get(f'{backend_name}_draw_columns', [])
+        draw_data = df.attrs.get(f'{backend_name}_draw_data', {})
+        
+        if draw_dist_df is not None and not draw_dist_df.empty:
+            # Populate the draw distribution table with weighted counts
+            # Get benchmarks from the main sheet
+            main_df = df[df['Bench'] != 'AVERAGE'] if 'Bench' in df.columns else df
+            
+            # For each draw type, calculate weighted counts for each column
+            for idx, draw_type in enumerate(draw_dist_df['Draw_Type']):
+                for col in draw_columns:
+                    # Extract config name without " (ratio)" suffix
+                    config_name = col.replace(' (ratio)', '')
+                    
+                    # Calculate weighted total for this draw type and column
+                    weighted_total = 0.0
+                    for bench_idx, bench in enumerate(main_df['Bench']):
+                        if bench in draw_data and draw_type in draw_data[bench]:
+                            weight = draw_data[bench][draw_type]
+                            weighted_total += weight
+                    
+                    # Store the weighted total
+                    draw_dist_df.at[idx, config_name] = weighted_total
+            
+            # Generate sheet name using backend name
+            dist_sheet_name = f"{sheet_name}_{backend_name}_draw_dist"[:31]
+            
+            # Write to Excel
+            draw_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+            dist_sheet = workbook[dist_sheet_name]
+            
+            # Format the distribution sheet
+            format_distribution_sheet(dist_sheet, draw_dist_df)
+            print(f"    ✓ Wrote draw call distribution table for backend '{backend_name}' to sheet '{dist_sheet_name}'")
+            
+            # Create chart for draw call distribution
+            compare_prefix = sheet_name.replace("_comparison","")
+            chart_title = f"{baseline_version} {compare_prefix} Draw Call Distribution ({backend_name} vs glesdmsaa)"
+            x_title = "Draw Type"
+            y_title = "Weighted Count"
+            
+            # Position chart below the data
+            chart_start_row = len(draw_dist_df) + 5
+            chart_position = f"C{chart_start_row}"
+            
+            # Create chart with draw types on x-axis
+            create_distribution_chart(dist_sheet, draw_dist_df, chart_title, x_title, y_title, chart_position)
 
     return df
 
