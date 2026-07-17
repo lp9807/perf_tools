@@ -1406,7 +1406,7 @@ def create_distribution_chart(dist_sheet, dist_df, chart_title, x_axis_title, y_
     chart = BarChart()
     chart.type = "col"
     chart.grouping = "clustered"
-    chart.style = 13  # Style 7
+    chart.style = 6  # Style 6
     chart.height = 14  # Height in inches
     chart.width = 22   # Width in inches
     chart.overlap = 0
@@ -1503,15 +1503,16 @@ def create_distribution_chart(dist_sheet, dist_df, chart_title, x_axis_title, y_
     
     # Set titles for each series with different colors
     # Color palette for different series
+    
     colors = [
-        '5B9BD5',  # Light Blue
-        '70AD47',  # Green
-        'FF6B6B',  # Red
-        '9B59B6',  # Purple
-        '3498DB',  # Cyan
-        'E67E22',  # Dark Orange
-        '2ECC71',  # Emerald
-        'E74C3C'   # Dark Red
+        '4472C4',  # Blue
+        'C0504D',  # Red
+        '9BBB59',  # Olive Green
+        '8064A2',  # Purple
+        '4BACC6',  # Aqua
+        'F79646',  # Orange
+        '7F7F7F',  # Gray
+        '93C47D',  # Light Green
     ]
     
     for idx, col_name in enumerate(dist_df.columns[start_data_col-1:]):
@@ -1807,7 +1808,7 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         glesdmsaa_ratio_dist_df = df.attrs['glesdmsaa_ratio_distribution']
         glesdmsaa_ratio_bins = df.attrs.get('glesdmsaa_ratio_bins', [])
         glesdmsaa_ratio_columns = df.attrs.get('glesdmsaa_ratio_columns', [])
-        dist_sheet_name = f"{sheet_name}_glesdmsaa_ratio_dist"[:31]
+        dist_sheet_name = sheet_name.replace("_comparison", "_glesdmsaa_ratio_dist")
         
         glesdmsaa_ratio_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
         dist_sheet = workbook[dist_sheet_name]
@@ -1818,7 +1819,8 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         print(f"    ✓ Wrote glesdmsaa ratio distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
         
         # Create chart for glesdmsaa ratio distribution
-        chart_title = f"{baseline_version} Nanobench Time Ratio Distribution (vs glesdmsaa)"
+        compare_prefix = sheet_name.replace("_comparison","")
+        chart_title = f"{baseline_version} {compare_prefix} Nanobench Time Ratio Distribution (vs glesdmsaa)"
         x_title = "Time Ratio Range"
         y_title = "Count"
         
@@ -1833,7 +1835,7 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         glesdmsaa_diff_dist_df = df.attrs['glesdmsaa_diff_distribution']
         glesdmsaa_diff_bins = df.attrs.get('glesdmsaa_diff_bins', [])
         glesdmsaa_diff_columns = df.attrs.get('glesdmsaa_diff_columns', [])
-        dist_sheet_name = f"{sheet_name}_glesdmsaa_diff_dist"[:31]
+        dist_sheet_name = sheet_name.replace("_comparison", "_glesdmsaa_diff_dist")
         
         glesdmsaa_diff_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
         dist_sheet = workbook[dist_sheet_name]
@@ -1844,7 +1846,8 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         print(f"    ✓ Wrote glesdmsaa diff distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
         
         # Create chart for glesdmsaa diff distribution
-        chart_title = f"{baseline_version} Nanobench Time Diff Distribution (vs glesdmsaa)"
+        compare_prefix = sheet_name.replace("_comparison","")
+        chart_title = f"{baseline_version} {compare_prefix} Nanobench Time Diff Distribution (vs glesdmsaa)"
         x_title = "Time Diff Range (ms)"
         y_title = "Count"
         
@@ -2119,12 +2122,13 @@ def main():
             )
             if cross_version_df is not None and not cross_version_df.empty:
                 # Write the main cross-version comparison
-                write_dataframe_with_formulas(writer, 'cross_version_comparison', cross_version_df, baseline_version)
+                cross_sheet_name = f"cross_version_comparison"
+                write_dataframe_with_formulas(writer, cross_sheet_name, cross_version_df, baseline_version)
                 
                 workbook = writer.book
-                sheet = workbook['cross_version_comparison']
+                sheet = workbook[cross_sheet_name]
                 apply_table_formatting_to_sheet(sheet, cross_version_df)
-                print(f"    ✓ Created 'cross_version_comparison' with {len(cross_version_df)} benchmarks, {len(cross_version_df.columns)} columns")
+                print(f"    ✓ Created '{cross_sheet_name}' with {len(cross_version_df)} benchmarks, {len(cross_version_df.columns)} columns")
                 
                 # Distribution tables are automatically written by write_dataframe_with_formulas
             else:
