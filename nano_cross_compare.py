@@ -882,6 +882,80 @@ def read_multiple_excel_files(excel_files):
             single_version_backends, version_benchmarks, baseline_version, 
             compare_versions, comparison_type, summary_columns_by_version, has_comparison_page)
 
+def add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name):
+    """
+    Add glesdmsaa distribution tables to the DataFrame as attributes.
+    This function is used for both imported and generated data.
+    """
+    # ============================================================
+    # Create glesdmsaa ratio distribution table
+    # ============================================================
+    if glesdmsaa_ratio_cols:
+        # Ratio bins for glesdmsaa comparisons
+        glesdmsaa_ratio_bins = [
+            (0.5, '[0, 0.5]'),
+            (1.0, '[0.5, 1]'),
+            (2.0, '[1, 2]'),
+            (10.0, '[2, 10]'),
+            (50.0, '[10, 50]'),
+            (100.0, '[50, 100]'),
+            (float('inf'), '>100')
+        ]
+        
+        # Build ratio distribution table
+        glesdmsaa_ratio_dist_data = {
+            'Bin': [threshold for threshold, _ in glesdmsaa_ratio_bins if threshold != float('inf')] + [''],
+            'Label': [label for _, label in glesdmsaa_ratio_bins]
+        }
+        
+        # Add empty columns for each glesdmsaa ratio column
+        for col in glesdmsaa_ratio_cols:
+            glesdmsaa_ratio_dist_data[col] = [''] * len(glesdmsaa_ratio_bins)
+        
+        glesdmsaa_ratio_dist_df = pd.DataFrame(glesdmsaa_ratio_dist_data)
+        
+        # Store as attributes
+        df.attrs['glesdmsaa_ratio_distribution'] = glesdmsaa_ratio_dist_df
+        df.attrs['glesdmsaa_ratio_bins'] = [threshold for threshold, _ in glesdmsaa_ratio_bins if threshold != float('inf')]
+        df.attrs['glesdmsaa_ratio_columns'] = glesdmsaa_ratio_cols
+        
+        print(f"    ✓ Created glesdmsaa ratio distribution table with {len(glesdmsaa_ratio_bins)} bins and {len(glesdmsaa_ratio_cols)} columns")
+    
+    # ============================================================
+    # Create glesdmsaa diff distribution table
+    # ============================================================
+    if glesdmsaa_diff_cols:
+        # Diff bins for glesdmsaa comparisons
+        glesdmsaa_diff_bins = [
+            (0.0, '<0'),
+            (1.0, '[0, 1]'),
+            (10.0, '[1, 10]'),
+            (50.0, '[10, 50]'),
+            (100.0, '[50, 100]'),
+            (float('inf'), '>100')
+        ]
+        
+        # Build diff distribution table
+        glesdmsaa_diff_dist_data = {
+            'Bin': [threshold for threshold, _ in glesdmsaa_diff_bins if threshold != float('inf')] + [''],
+            'Label': [label for _, label in glesdmsaa_diff_bins]
+        }
+        
+        # Add empty columns for each glesdmsaa diff column
+        for col in glesdmsaa_diff_cols:
+            glesdmsaa_diff_dist_data[col] = [''] * len(glesdmsaa_diff_bins)
+        
+        glesdmsaa_diff_dist_df = pd.DataFrame(glesdmsaa_diff_dist_data)
+        
+        # Store as attributes
+        df.attrs['glesdmsaa_diff_distribution'] = glesdmsaa_diff_dist_df
+        df.attrs['glesdmsaa_diff_bins'] = [threshold for threshold, _ in glesdmsaa_diff_bins if threshold != float('inf')]
+        df.attrs['glesdmsaa_diff_columns'] = glesdmsaa_diff_cols
+        
+        print(f"    ✓ Created glesdmsaa diff distribution table with {len(glesdmsaa_diff_bins)} bins and {len(glesdmsaa_diff_cols)} columns")
+    
+    return df
+
 def create_version_comparison_page(version_data, version_name,
                                     summary_columns, missing_benchmarks_for_version, 
                                     version_benchmarks, baseline_version, is_baseline=False):
@@ -896,17 +970,50 @@ def create_version_comparison_page(version_data, version_name,
     has_existing = version_data.get('has_comparison_page', False)
     excel_file = version_data.get('file')
     
+    # ============================================================
+    # CASE 1: Import existing comparison page
+    # ============================================================
     if has_existing and excel_file:
         print(f"    Found existing comparison page in {Path(excel_file).name} - importing it")
         imported_df = import_existing_comparison_page(excel_file, version_name, version_data)
         if imported_df is not None and not imported_df.empty:
             print(f"    ✓ Successfully imported existing comparison page with {len(imported_df)} benchmarks")
             print(f"    ✓ Preserved all existing columns including configs")
+            
+            # ============================================================
+            # Identify glesdmsaa columns from imported data
+            # ============================================================
+            glesdmsaa_ratio_cols = []
+            glesdmsaa_diff_cols = []
+            
+            # Search for columns that contain 'glesdmsaa' in their name
+            for col in imported_df.columns:
+                if 'glesdmsaa' in col.lower():
+                    if 'ratio' in col.lower():
+                        glesdmsaa_ratio_cols.append(col)
+                    elif 'diff' in col.lower():
+                        glesdmsaa_diff_cols.append(col)
+            
+            if glesdmsaa_ratio_cols or glesdmsaa_diff_cols:
+                print(f"    Found glesdmsaa columns in imported data:")
+                if glesdmsaa_ratio_cols:
+                    print(f"      - Ratio columns: {', '.join(glesdmsaa_ratio_cols)}")
+                if glesdmsaa_diff_cols:
+                    print(f"      - Diff columns: {', '.join(glesdmsaa_diff_cols)}")
+                
+                # Create distribution tables from imported data
+                imported_df = add_glesdmsaa_distribution_tables(imported_df, 
+                                                                glesdmsaa_ratio_cols, 
+                                                                glesdmsaa_diff_cols,
+                                                                version_name)
+            
             return imported_df
         else:
             print(f"    ⚠️ Failed to import existing comparison page, generating new one")
     
-    # If no existing page or import failed, generate using current logic
+    # ============================================================
+    # CASE 2: Generate new comparison page
+    # ============================================================
     print(f"    Generating new comparison page for version: {version_name}")
     
     # Find benchmarks that exist in ALL backends for this version
@@ -948,7 +1055,9 @@ def create_version_comparison_page(version_data, version_name,
     
     print(f"    Backend columns found: {', '.join(backend_columns.keys())}")
     
-    # Generate ratio_configs dynamically:
+    # ============================================================
+    # EXISTING LOGIC: Generate ratio_configs dynamically
+    # ============================================================
     # 1. Compare any backend (except glesdmsaa) with glesdmsaa
     # 2. Compare any backend starting with 'gr' with grdawn_vk
     # 3. Compare grvk with vkdmsaa if both exist
@@ -982,20 +1091,33 @@ def create_version_comparison_page(version_data, version_name,
     for config in ratio_configs:
         print(f"      - {config[0]} = {config[1]}/{config[2]}")
     
-    ratio_columns = []
+    # Track all ratio and diff columns
+    all_ratio_columns = []
+    all_diff_columns = []
+    
+    # Track glesdmsaa-specific columns (configs where denominator is glesdmsaa)
+    glesdmsaa_ratio_cols = []
+    glesdmsaa_diff_cols = []
+    
     for config_name, num_backend, den_backend in ratio_configs:
         if num_backend in backend_columns and den_backend in backend_columns:
             # Ratio column (division)
             ratio_col_name = f"{config_name} (ratio)"
             comparison_data[ratio_col_name] = [f"FORMULA:{num_backend}/{den_backend}"] * len(benches)
-            ratio_columns.append(ratio_col_name)
-            print(f"      ✓ Added ratio column: '{ratio_col_name}' = {num_backend}/{den_backend}")
+            all_ratio_columns.append(ratio_col_name)
             
             # Diff column (subtraction)
             diff_col_name = f"{config_name} (diff)"
             comparison_data[diff_col_name] = [f"FORMULA:{num_backend}-{den_backend}"] * len(benches)
-            ratio_columns.append(diff_col_name)
+            all_diff_columns.append(diff_col_name)
+            
+            print(f"      ✓ Added ratio column: '{ratio_col_name}' = {num_backend}/{den_backend}")
             print(f"      ✓ Added diff column: '{diff_col_name}' = {num_backend}-{den_backend}")
+            
+            # Track glesdmsaa-specific columns (where denominator is glesdmsaa)
+            if den_backend == 'glesdmsaa':
+                glesdmsaa_ratio_cols.append(ratio_col_name)
+                glesdmsaa_diff_cols.append(diff_col_name)
         else:
             print(f"      ✗ WARNING: Backends not found for {config_name}")
             if num_backend not in backend_columns:
@@ -1003,7 +1125,11 @@ def create_version_comparison_page(version_data, version_name,
             if den_backend not in backend_columns:
                 print(f"        Missing denominator: {den_backend}")
     
-    print(f"    Total columns added: {len(ratio_columns)} (ratio + diff)")
+    print(f"    Total columns added: {len(all_ratio_columns) + len(all_diff_columns)} (ratio + diff)")
+    if glesdmsaa_ratio_cols:
+        print(f"    Glesdmsaa ratio columns: {len(glesdmsaa_ratio_cols)}")
+    if glesdmsaa_diff_cols:
+        print(f"    Glesdmsaa diff columns: {len(glesdmsaa_diff_cols)}")
     
     # Add summary columns from this version's comparison page if provided
     if version_summary_columns:
@@ -1016,6 +1142,11 @@ def create_version_comparison_page(version_data, version_name,
     
     # Create DataFrame
     df = pd.DataFrame(comparison_data)
+    
+    # ============================================================
+    # Add glesdmsaa distribution tables (for generated data)
+    # ============================================================
+    df = add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name)
     
     # Add average row at the end
     if len(df) > 0:
@@ -1669,6 +1800,58 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         chart_position = f"C{chart_start_row}"
         create_distribution_chart(dist_sheet, diff_dist_df, chart_title, x_title, y_title, chart_position)
     
+    # ============================================================
+    # NEW: Write glesdmsaa ratio distribution table
+    # ============================================================
+    if df.attrs.get('glesdmsaa_ratio_distribution') is not None:
+        glesdmsaa_ratio_dist_df = df.attrs['glesdmsaa_ratio_distribution']
+        glesdmsaa_ratio_bins = df.attrs.get('glesdmsaa_ratio_bins', [])
+        glesdmsaa_ratio_columns = df.attrs.get('glesdmsaa_ratio_columns', [])
+        dist_sheet_name = f"{sheet_name}_glesdmsaa_ratio_dist"[:31]
+        
+        glesdmsaa_ratio_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+        dist_sheet = workbook[dist_sheet_name]
+        
+        add_frequency_formulas(dist_sheet, glesdmsaa_ratio_bins, glesdmsaa_ratio_columns, 
+                              main_sheet_name, col_letters, data_start_row, data_end_row)
+        format_distribution_sheet(dist_sheet, glesdmsaa_ratio_dist_df)
+        print(f"    ✓ Wrote glesdmsaa ratio distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
+        
+        # Create chart for glesdmsaa ratio distribution
+        chart_title = f"{baseline_version} Nanobench Time Ratio Distribution (vs glesdmsaa)"
+        x_title = "Time Ratio Range"
+        y_title = "Count"
+        
+        chart_start_row = len(glesdmsaa_ratio_dist_df) + 5
+        chart_position = f"C{chart_start_row}"
+        create_distribution_chart(dist_sheet, glesdmsaa_ratio_dist_df, chart_title, x_title, y_title, chart_position)
+    
+    # ============================================================
+    # NEW: Write glesdmsaa diff distribution table
+    # ============================================================
+    if df.attrs.get('glesdmsaa_diff_distribution') is not None:
+        glesdmsaa_diff_dist_df = df.attrs['glesdmsaa_diff_distribution']
+        glesdmsaa_diff_bins = df.attrs.get('glesdmsaa_diff_bins', [])
+        glesdmsaa_diff_columns = df.attrs.get('glesdmsaa_diff_columns', [])
+        dist_sheet_name = f"{sheet_name}_glesdmsaa_diff_dist"[:31]
+        
+        glesdmsaa_diff_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+        dist_sheet = workbook[dist_sheet_name]
+        
+        add_frequency_formulas(dist_sheet, glesdmsaa_diff_bins, glesdmsaa_diff_columns, 
+                              main_sheet_name, col_letters, data_start_row, data_end_row)
+        format_distribution_sheet(dist_sheet, glesdmsaa_diff_dist_df)
+        print(f"    ✓ Wrote glesdmsaa diff distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
+        
+        # Create chart for glesdmsaa diff distribution
+        chart_title = f"{baseline_version} Nanobench Time Diff Distribution (vs glesdmsaa)"
+        x_title = "Time Diff Range (ms)"
+        y_title = "Count"
+        
+        chart_start_row = len(glesdmsaa_diff_dist_df) + 5
+        chart_position = f"C{chart_start_row}"
+        create_distribution_chart(dist_sheet, glesdmsaa_diff_dist_df, chart_title, x_title, y_title, chart_position)
+
     return df
 
 def apply_table_formatting_to_sheet(sheet, df):
