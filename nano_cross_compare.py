@@ -6,26 +6,26 @@ Benchmark Analysis Tool - Version 2.9
 Script to process multiple Excel files and generate comparison with version tracking.
 
 Version History:
-- v1.0: Initial release with CSV file inputs
-- v2.0: Major redesign - switched to Excel file input, optional folders, 3 ratio columns
-- v2.1: Multiple Excel files support, API version detection, cross-version comparisons
-- v2.2: Reorganized column order - backend columns first, then ratio columns
-- v2.3: Simplified column names when only one input file (no version suffix)
-- v2.4: Backup original backend pages into output workbook as separate sheets
-- v2.5: Separate comparison pages per version + dedicated cross-version page
-- v2.6: Extract summary columns from existing comparison page and append to new pages
-- v2.7: Report issues AND filter benchmarks to only include those existing in all backends
-- v2.8: Detect Skia version (m[0-9]+) and intelligently determine baseline/compare versions
-- v2.9: Cache backend name extraction, simplify baseline handling, improve performance
+ v1.0: Initial release with CSV file inputs
+ v2.0: Major redesign - switched to Excel file input, optional folders, 3 ratio columns
+ v2.1: Multiple Excel files support, API version detection, cross-version comparisons
+ v2.2: Reorganized column order - backend columns first, then ratio columns
+ v2.3: Simplified column names when only one input file (no version suffix)
+ v2.4: Backup original backend pages into output workbook as separate sheets
+ v2.5: Separate comparison pages per version + dedicated cross-version page
+ v2.6: Extract summary columns from existing comparison page and append to new pages
+ v2.7: Report issues AND filter benchmarks to only include those existing in all backends
+ v2.8: Detect Skia version (m[0-9]+) and intelligently determine baseline/compare versions
+ v2.9: Cache backend name extraction, simplify baseline handling, improve performance
 
 Features:
-- Accepts 0-2 folder paths for trace analysis (optional)
-- Accepts MULTIPLE Excel files with multiple sheets (one per backend)
-- Detects API version (api[0-9]+) AND Skia version (m[0-9]+) from filename
-- Intelligently determines baseline and compare versions
-- Generates comparison pages with baseline as reference
-- Auto-increments output filename version number with baseline info
-- Caches backend name extraction for better performance
+ Accepts 0-2 folder paths for trace analysis (optional)
+ Accepts MULTIPLE Excel files with multiple sheets (one per backend)
+ Detects API version (api[0-9]+) AND Skia version (m[0-9]+) from filename
+ Intelligently determines baseline and compare versions
+ Generates comparison pages with baseline as reference
+ Auto-increments output filename version number with baseline info
+ Caches backend name extraction for better performance
 
 Usage: python script.py [<folder_path1>] [<folder_path2>] <excel_file1.xlsx> [<excel_file2.xlsx> ...]
 
@@ -1090,8 +1090,6 @@ def calculate_draw_type_weights_for_benchmark(summary_entry, total_sub_count):
             # Remove the trailing ']' if present
             if draw_data.endswith(']'):
                 draw_data = draw_data[:-1]
-                
-            print(f"parse draw type sequence: {draw_data}")
             
             if not draw_data:
                 continue
@@ -1212,6 +1210,216 @@ def get_draw_type_data_from_summary(df, summary_columns):
     
     return draw_type_data
 
+def calculate_draw_type_distribution(dist_df, df, summary_col_name, config_col_name):
+    """
+    Calculate and populate draw type weighted counts into the distribution table.
+    
+    This is the unique logic that:
+    1. Parses summary strings to extract draw type weighted counts per benchmark
+    2. Uses the config column (grdawn_vk vs glesdmsaa ratio/diff) to determine bin placement
+    3. Handles both numeric values and formula expressions in the config column
+    4. Aggregates weighted counts into the appropriate bin for each draw type
+    
+    Args:
+        dist_df: The distribution DataFrame to fill (with Bin, Label, and draw type columns)
+        df: The main comparison DataFrame
+        summary_col_name: The summary column name containing draw type data
+        config_col_name: The config column name (grdawn_vk vs glesdmsaa ratio/diff)
+    
+    Returns:
+        Filled distribution DataFrame with weighted counts for each draw type per bin
+    """
+    if summary_col_name not in df.columns or config_col_name not in df.columns:
+        return dist_df
+    
+    # Extract draw type data from the summary column
+    summary_values = df[summary_col_name].tolist()
+    draw_type_data = get_draw_type_data_from_summary(df, {summary_col_name: summary_values})
+    
+    if not draw_type_data or summary_col_name not in draw_type_data:
+        return dist_df
+    
+    summary_info = draw_type_data[summary_col_name]
+    bench_data = summary_info['data']
+    
+    # Get all unique draw types from this backend
+    all_draw_types = set()
+    for bench_info in bench_data.values():
+        all_draw_types.update(bench_info.keys())
+    
+    if not all_draw_types:
+        return dist_df
+    
+    sorted_draw_types = sorted(all_draw_types)
+    
+    # Ensure the distribution DataFrame has columns for all draw types
+    for draw_type in sorted_draw_types:
+        if draw_type not in dist_df.columns:
+            dist_df[draw_type] = 0.0
+    
+    # Get bin thresholds from the distribution table
+    bin_thresholds = []
+    for val in dist_df['Bin']:
+        if val != '' and not pd.isna(val):
+            try:
+                bin_thresholds.append(float(val))
+            except (ValueError, TypeError):
+                pass
+    
+    # Get the config values for each benchmark (excluding AVERAGE row)
+    main_df = df[df['Bench'] != 'AVERAGE']
+    config_values = main_df[config_col_name].tolist()
+    benches = main_df['Bench'].tolist()
+    
+    # For each benchmark, get its weighted draw type counts and config value
+    for bench_idx, bench in enumerate(benches):
+        if bench_idx < len(config_values):
+            config_val = config_values[bench_idx]
+            
+            # Skip invalid config values
+            if config_val is None or pd.isna(config_val):
+                continue
+            
+            # Calculate numeric value from formula if needed (private calculation)
+            numeric_val = None
+            
+            # Check if it's a formula placeholder
+            if isinstance(config_val, str) and config_val.startswith('FORMULA:'):
+                formula_expr = config_val[8:]  # Remove 'FORMULA:' prefix
+                                
+                # Evaluate the formula using the actual data
+                try:
+                    # Parse formula expression like "grdawn_vk/glesdmsaa" or "grdawn_vk-glesdmsaa"
+                    if '/' in formula_expr:
+                        parts = formula_expr.split('/')
+                        if len(parts) == 2:
+                            num_ref = parts[0].strip()
+                            den_ref = parts[1].strip()
+                            
+                            # Parse Excel cell reference (e.g., "D10" -> column D, row 10)
+                            num_col_letter = ''.join([c for c in num_ref if c.isalpha()])
+                            num_row = int(''.join([c for c in num_ref if c.isdigit()]))
+                            
+                            den_col_letter = ''.join([c for c in den_ref if c.isalpha()])
+                            den_row = int(''.join([c for c in den_ref if c.isdigit()]))
+                            
+                            # Convert column letter to index (A=0, B=1, etc.)
+                            num_col_idx = 0
+                            for char in num_col_letter:
+                                num_col_idx = num_col_idx * 26 + (ord(char.upper()) - ord('A') + 1)
+                            num_col_idx -= 1  # Convert to 0-based
+                            
+                            den_col_idx = 0
+                            for char in den_col_letter:
+                                den_col_idx = den_col_idx * 26 + (ord(char.upper()) - ord('A') + 1)
+                            den_col_idx -= 1  # Convert to 0-based
+                            
+                            # Get values from DataFrame
+                            # Note: row_idx in DataFrame corresponds to Excel row (row_idx + 2 in Excel)
+                            # But the formula references specific Excel rows, so we need to map them
+                            # Excel row 1 = header, so data rows start at 2
+                            # DataFrame index 0 = Excel row 2
+                            # So DataFrame row index = Excel row - 2
+                            df_row_idx = num_row - 2
+                            den_df_row_idx = den_row - 2
+                            
+                            # Get column names from DataFrame
+                            if num_col_idx < len(df.columns) and den_col_idx < len(df.columns):
+                                num_col_name = df.columns[num_col_idx]
+                                den_col_name = df.columns[den_col_idx]
+                                
+                                num_val = df.iloc[df_row_idx][num_col_name] if df_row_idx < len(df) else None
+                                den_val = df.iloc[den_df_row_idx][den_col_name] if den_df_row_idx < len(df) else None
+                                
+                                if num_val is not None and den_val is not None and den_val != 0:
+                                    try:
+                                        numeric_val = float(num_val) / float(den_val)
+                                    except (ValueError, TypeError, ZeroDivisionError):
+                                        pass
+                    elif '-' in formula_expr:
+                        parts = formula_expr.split('-')
+                        if len(parts) == 2:
+                            num_ref = parts[0].strip()
+                            den_ref = parts[1].strip()
+                            
+                            # Parse Excel cell reference
+                            num_col_letter = ''.join([c for c in num_ref if c.isalpha()])
+                            num_row = int(''.join([c for c in num_ref if c.isdigit()]))
+                            
+                            den_col_letter = ''.join([c for c in den_ref if c.isalpha()])
+                            den_row = int(''.join([c for c in den_ref if c.isdigit()]))
+                            
+                            # Convert column letter to index
+                            num_col_idx = 0
+                            for char in num_col_letter:
+                                num_col_idx = num_col_idx * 26 + (ord(char.upper()) - ord('A') + 1)
+                            num_col_idx -= 1
+                            
+                            den_col_idx = 0
+                            for char in den_col_letter:
+                                den_col_idx = den_col_idx * 26 + (ord(char.upper()) - ord('A') + 1)
+                            den_col_idx -= 1
+                            
+                            # Get values from DataFrame
+                            df_row_idx = num_row - 2
+                            den_df_row_idx = den_row - 2
+                            
+                            if num_col_idx < len(df.columns) and den_col_idx < len(df.columns):
+                                num_col_name = df.columns[num_col_idx]
+                                den_col_name = df.columns[den_col_idx]
+                                
+                                num_val = df.iloc[df_row_idx][num_col_name] if df_row_idx < len(df) else None
+                                den_val = df.iloc[den_df_row_idx][den_col_name] if den_df_row_idx < len(df) else None
+                                
+                                if num_val is not None and den_val is not None:
+                                    try:
+                                        numeric_val = float(num_val) - float(den_val)
+                                    except (ValueError, TypeError):
+                                        pass
+                except (ValueError, TypeError, IndexError, ZeroDivisionError):
+                    pass
+            
+            # If not a formula or formula evaluation failed, try to convert directly
+            if numeric_val is None:
+                try:
+                    numeric_val = float(config_val)
+                except (ValueError, TypeError):
+                    continue
+            
+            # Skip if we couldn't get a numeric value
+            if numeric_val is None:
+                continue
+            
+            # Determine which bin this config value falls into
+            bin_idx = -1
+            for i, threshold in enumerate(bin_thresholds):
+                if numeric_val <= threshold:
+                    bin_idx = i
+                    break
+            
+            # If value is greater than all thresholds, it goes to the last bin
+            if bin_idx == -1:
+                bin_idx = len(bin_thresholds)  # Last bin (the one with empty Bin value)
+            
+            # Get weighted counts for this benchmark
+            weighted_counts = bench_data.get(bench, {})
+            
+            # Add weighted counts to the appropriate bin and draw type cells
+            for draw_type, weight in weighted_counts.items():
+                if draw_type in dist_df.columns:
+                    # Convert to float and add weight
+                    current_val = dist_df.at[bin_idx, draw_type]
+                    if isinstance(current_val, str):
+                        current_val = 0.0
+                    dist_df.at[bin_idx, draw_type] = float(current_val) + float(weight)
+    
+    # Round values to 3 decimal places for readability
+    for col in sorted_draw_types:
+        if col in dist_df.columns:
+            dist_df[col] = dist_df[col].round(3)
+    
+    return dist_df
+
 def add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_cols, version_name, summary_columns=None):
     """
     Add glesdmsaa distribution tables to the DataFrame as attributes.
@@ -1219,128 +1427,157 @@ def add_glesdmsaa_distribution_tables(df, glesdmsaa_ratio_cols, glesdmsaa_diff_c
     
     Now includes draw call count distribution for each backend vs glesdmsaa config.
     """
+    
+    # Define standard bins (used for both glesdmsaa and draw distributions)
+    ratio_bins = [
+        (0.5, '[0, 0.5]'),
+        (1.0, '[0.5, 1]'),
+        (2.0, '[1, 2]'),
+        (10.0, '[2, 10]'),
+        (50.0, '[10, 50]'),
+        (100.0, '[50, 100]'),
+        (float('inf'), '>100')
+    ]
+    
+    diff_bins = [
+        (0.0, '<0'),
+        (1.0, '[0, 1]'),
+        (10.0, '[1, 10]'),
+        (50.0, '[10, 50]'),
+        (100.0, '[50, 100]'),
+        (float('inf'), '>100')
+    ]
+    
     # ============================================================
     # Create glesdmsaa ratio distribution table
     # ============================================================
-    if glesdmsaa_ratio_cols:
-        # Ratio bins for glesdmsaa comparisons
-        glesdmsaa_ratio_bins = [
-            (0.5, '[0, 0.5]'),
-            (1.0, '[0.5, 1]'),
-            (2.0, '[1, 2]'),
-            (10.0, '[2, 10]'),
-            (50.0, '[10, 50]'),
-            (100.0, '[50, 100]'),
-            (float('inf'), '>100')
-        ]
-        
+    if glesdmsaa_ratio_cols:        
         # Build ratio distribution table
         glesdmsaa_ratio_dist_data = {
-            'Bin': [threshold for threshold, _ in glesdmsaa_ratio_bins if threshold != float('inf')] + [''],
-            'Label': [label for _, label in glesdmsaa_ratio_bins]
+            'Bin': [threshold for threshold, _ in ratio_bins if threshold != float('inf')] + [''],
+            'Label': [label for _, label in ratio_bins]
         }
         
         # Add empty columns for each glesdmsaa ratio column
         for col in glesdmsaa_ratio_cols:
-            glesdmsaa_ratio_dist_data[col] = [''] * len(glesdmsaa_ratio_bins)
+            glesdmsaa_ratio_dist_data[col] = [''] * len(ratio_bins)
         
         glesdmsaa_ratio_dist_df = pd.DataFrame(glesdmsaa_ratio_dist_data)
         
         # Store as attributes
         df.attrs['glesdmsaa_ratio_distribution'] = glesdmsaa_ratio_dist_df
-        df.attrs['glesdmsaa_ratio_bins'] = [threshold for threshold, _ in glesdmsaa_ratio_bins if threshold != float('inf')]
+        df.attrs['glesdmsaa_ratio_bins'] = [threshold for threshold, _ in ratio_bins if threshold != float('inf')]
         df.attrs['glesdmsaa_ratio_columns'] = glesdmsaa_ratio_cols
         
-        print(f"    ✓ Created glesdmsaa ratio distribution table with {len(glesdmsaa_ratio_bins)} bins and {len(glesdmsaa_ratio_cols)} columns")
+        print(f"    ✓ Created glesdmsaa ratio distribution table with {len(ratio_bins)} bins and {len(glesdmsaa_ratio_cols)} columns")
     
     # ============================================================
     # Create glesdmsaa diff distribution table
     # ============================================================
     if glesdmsaa_diff_cols:
-        # Diff bins for glesdmsaa comparisons
-        glesdmsaa_diff_bins = [
-            (0.0, '<0'),
-            (1.0, '[0, 1]'),
-            (10.0, '[1, 10]'),
-            (50.0, '[10, 50]'),
-            (100.0, '[50, 100]'),
-            (float('inf'), '>100')
-        ]
-        
         # Build diff distribution table
         glesdmsaa_diff_dist_data = {
-            'Bin': [threshold for threshold, _ in glesdmsaa_diff_bins if threshold != float('inf')] + [''],
-            'Label': [label for _, label in glesdmsaa_diff_bins]
+            'Bin': [threshold for threshold, _ in diff_bins if threshold != float('inf')] + [''],
+            'Label': [label for _, label in diff_bins]
         }
         
         # Add empty columns for each glesdmsaa diff column
         for col in glesdmsaa_diff_cols:
-            glesdmsaa_diff_dist_data[col] = [''] * len(glesdmsaa_diff_bins)
+            glesdmsaa_diff_dist_data[col] = [''] * len(diff_bins)
         
         glesdmsaa_diff_dist_df = pd.DataFrame(glesdmsaa_diff_dist_data)
         
         # Store as attributes
         df.attrs['glesdmsaa_diff_distribution'] = glesdmsaa_diff_dist_df
-        df.attrs['glesdmsaa_diff_bins'] = [threshold for threshold, _ in glesdmsaa_diff_bins if threshold != float('inf')]
+        df.attrs['glesdmsaa_diff_bins'] = [threshold for threshold, _ in diff_bins if threshold != float('inf')]
         df.attrs['glesdmsaa_diff_columns'] = glesdmsaa_diff_cols
         
-        print(f"    ✓ Created glesdmsaa diff distribution table with {len(glesdmsaa_diff_bins)} bins and {len(glesdmsaa_diff_cols)} columns")
+        print(f"    ✓ Created glesdmsaa diff distribution table with {len(diff_bins)} bins and {len(glesdmsaa_diff_cols)} columns")
     
+
     # ============================================================
-    # NEW: Create draw call count distribution for grdawn_vk vs glesdmsaa ratio
+    # Generate draw call distribution tables
     # ============================================================
-    if summary_columns and glesdmsaa_ratio_cols:
-        # Extract draw type data from summary columns
-        draw_type_data = get_draw_type_data_from_summary(df, summary_columns)
+    if summary_columns:
+        print(f"    Generating draw call distribution tables from summary columns...")
         
-        if draw_type_data:
-            # Process each summary column separately
-            for summary_col, summary_info in draw_type_data.items():
-                backend_name = summary_info['backend']
-                bench_data = summary_info['data']
+        # Find config columns for grdawn_vk vs glesdmsaa
+        ratio_config_col = None
+        diff_config_col = None
+        
+        for col in df.columns:
+            if "grdawn_vk vs glesdmsaa" in col:
+                if "ratio" in col.lower():
+                    ratio_config_col = col
+                elif "diff" in col.lower():
+                    diff_config_col = col
+        
+        # Process each summary column (each represents a different backend)
+        for summary_col_name in summary_columns.keys():
+            summary_type_name = summary_col_name.replace("summary of ", "")
+            print(f"creating draw call distribution data for {summary_type_name}")
+
+            # Generate ratio draw distribution using standard ratio_bins
+            if ratio_config_col:
+                # Build base distribution table structure
+                bin_thresholds = [threshold for threshold, _ in ratio_bins if threshold != float('inf')]
+                bin_labels = [label for _, label in ratio_bins]
                 
-                # Find ratio columns for this backend vs glesdmsaa
-                backend_ratio_cols = [col for col in glesdmsaa_ratio_cols 
-                                     if col.startswith(f"grdawn_vk vs glesdmsaa")]
-                
-                if not backend_ratio_cols:
-                    print(f"    ⚠️ No ratio columns found for backend grdawn_vk vs glesdmsaa")
-                    continue
-                
-                # Get all unique draw types
-                all_draw_types = set()
-                for bench_info in bench_data.values():
-                    all_draw_types.update(bench_info.keys())
-                
-                if not all_draw_types:
-                    print(f"    ⚠️ No draw types found for backend '{backend_name}'")
-                    continue
-                
-                print(f"    Found {len(all_draw_types)} draw types for backend '{backend_name}'")
-                
-                # Create draw call distribution table
-                draw_dist_data = {
-                    'Draw_Type': sorted(all_draw_types)
+                dist_data = {
+                    'Bin': bin_thresholds + [''],
+                    'Label': bin_labels
                 }
+                ratio_dist_df = pd.DataFrame(dist_data)
+                                
+                # Fill with weighted counts using the unique logic
+                ratio_dist_df = calculate_draw_type_distribution(
+                    ratio_dist_df, df, summary_col_name, ratio_config_col
+                )
                 
-                # Add columns for each ratio column (with backend name in column header)
-                for col in backend_ratio_cols:
-                    # Extract the config name without " (ratio)" suffix
-                    config_name = col.replace(' (ratio)', '')
-                    draw_dist_data[config_name] = [''] * len(all_draw_types)
+                # Check if any draw types were found
+                draw_columns = [col for col in ratio_dist_df.columns if col not in ['Bin', 'Label']]
+                if draw_columns:
+                    # Store as attributes
+                    attr_name = f"{summary_type_name}_ratio_draw_distribution"
+                    df.attrs[attr_name] = ratio_dist_df
+                    #df.attrs[f"{summary_type_name}_ratio_draw_types"] = sorted(draw_columns)
+                    #df.attrs[f"{summary_type_name}_ratio_draw_config_column"] = ratio_config_col
+                    #df.attrs[f"{summary_type_name}_ratio_draw_bins"] = ratio_bins
+                    
+                    print(f"    ✓ Created ratio draw distribution for summary column '{summary_type_name}' with {len(draw_columns)} draw types")
+            
+            # Generate diff draw distribution using standard diff_bins
+            if diff_config_col:
+                # Build base distribution table structure
+                bin_thresholds = [threshold for threshold, _ in diff_bins if threshold != float('inf')]
+                bin_labels = [label for _, label in diff_bins]
                 
-                draw_dist_df = pd.DataFrame(draw_dist_data)
+                dist_data = {
+                    'Bin': bin_thresholds + [''],
+                    'Label': bin_labels
+                }
+                diff_dist_df = pd.DataFrame(dist_data)
                 
-                # Store as attributes with backend-specific naming
-                attr_prefix = f"{backend_name}"
-                df.attrs[f'{attr_prefix}_draw_distribution'] = draw_dist_df
-                df.attrs[f'{attr_prefix}_draw_columns'] = backend_ratio_cols
-                df.attrs[f'{attr_prefix}_draw_data'] = bench_data
-                df.attrs[f'{attr_prefix}_draw_backend'] = backend_name
+                # Fill with weighted counts using the unique logic
+                diff_dist_df = calculate_draw_type_distribution(
+                    diff_dist_df, df, summary_col_name, diff_config_col
+                )
                 
-                print(f"    ✓ Created draw call distribution table for backend '{backend_name}' with {len(all_draw_types)} draw types and {len(backend_ratio_cols)} columns")
-        else:
-            print(f"    ⚠️ No draw type data available from summary columns")
+                # Check if any draw types were found
+                draw_columns = [col for col in diff_dist_df.columns if col not in ['Bin', 'Label']]
+                if draw_columns:
+                    # Store as attributes
+                    attr_name = f"{summary_type_name}_diff_draw_distribution"
+                    df.attrs[attr_name] = diff_dist_df
+                    #df.attrs[f"{summary_type_name}_diff_draw_types"] = sorted(draw_columns)
+                    #df.attrs[f"{summary_type_name}_diff_draw_config_column"] = diff_config_col
+                    #df.attrs[f"{summary_type_name}_diff_draw_bins"] = diff_bins
+                    
+                    print(f"    ✓ Created diff draw distribution for summary column '{summary_type_name}' with {len(draw_columns)} draw types")
+        
+        print(f"    ✓ Finished generating draw distribution tables")
+    else:
+        print(f"    ⚠️ No summary columns provided - cannot generate draw distribution tables")
     
     return df
 
@@ -2191,120 +2428,122 @@ def write_dataframe_with_formulas(writer, sheet_name, df, baseline_version, add_
         create_distribution_chart(dist_sheet, diff_dist_df, chart_title, x_title, y_title, chart_position)
     
     # ============================================================
-    # NEW: Write glesdmsaa ratio distribution table
+    # Write glesdmsaa ratio distribution table
     # ============================================================
     if df.attrs.get('glesdmsaa_ratio_distribution') is not None:
         glesdmsaa_ratio_dist_df = df.attrs['glesdmsaa_ratio_distribution']
         glesdmsaa_ratio_bins = df.attrs.get('glesdmsaa_ratio_bins', [])
         glesdmsaa_ratio_columns = df.attrs.get('glesdmsaa_ratio_columns', [])
-        dist_sheet_name = sheet_name.replace("_comparison", "_glesdmsaa_ratio_dist")
-        
+        dist_sheet_name = sheet_name.replace("_comparison", "_ratio_dist")
+
         glesdmsaa_ratio_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
         dist_sheet = workbook[dist_sheet_name]
-        
-        add_frequency_formulas(dist_sheet, glesdmsaa_ratio_bins, glesdmsaa_ratio_columns, 
+
+        add_frequency_formulas(dist_sheet, glesdmsaa_ratio_bins, glesdmsaa_ratio_columns,
                               main_sheet_name, col_letters, data_start_row, data_end_row)
         format_distribution_sheet(dist_sheet, glesdmsaa_ratio_dist_df)
         print(f"    ✓ Wrote glesdmsaa ratio distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
-        
+
         # Create chart for glesdmsaa ratio distribution
         compare_prefix = sheet_name.replace("_comparison","")
         chart_title = f"{baseline_version} {compare_prefix} Nanobench Time Ratio Distribution (vs glesdmsaa)"
         x_title = "Time Ratio Range"
         y_title = "Count"
-        
+
         chart_start_row = len(glesdmsaa_ratio_dist_df) + 5
         chart_position = f"C{chart_start_row}"
         create_distribution_chart(dist_sheet, glesdmsaa_ratio_dist_df, chart_title, x_title, y_title, chart_position)
-    
+
     # ============================================================
-    # NEW: Write glesdmsaa diff distribution table
+    # Write glesdmsaa diff distribution table
     # ============================================================
     if df.attrs.get('glesdmsaa_diff_distribution') is not None:
         glesdmsaa_diff_dist_df = df.attrs['glesdmsaa_diff_distribution']
         glesdmsaa_diff_bins = df.attrs.get('glesdmsaa_diff_bins', [])
         glesdmsaa_diff_columns = df.attrs.get('glesdmsaa_diff_columns', [])
-        dist_sheet_name = sheet_name.replace("_comparison", "_glesdmsaa_diff_dist")
-        
+        dist_sheet_name = sheet_name.replace("_comparison", "_diff_dist")
+
         glesdmsaa_diff_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
         dist_sheet = workbook[dist_sheet_name]
-        
-        add_frequency_formulas(dist_sheet, glesdmsaa_diff_bins, glesdmsaa_diff_columns, 
+
+        add_frequency_formulas(dist_sheet, glesdmsaa_diff_bins, glesdmsaa_diff_columns,
                               main_sheet_name, col_letters, data_start_row, data_end_row)
         format_distribution_sheet(dist_sheet, glesdmsaa_diff_dist_df)
         print(f"    ✓ Wrote glesdmsaa diff distribution table to sheet '{dist_sheet_name}' with FREQUENCY (ArrayFormula)")
-        
+
         # Create chart for glesdmsaa diff distribution
         compare_prefix = sheet_name.replace("_comparison","")
         chart_title = f"{baseline_version} {compare_prefix} Nanobench Time Diff Distribution (vs glesdmsaa)"
         x_title = "Time Diff Range (ms)"
         y_title = "Count"
-        
+
         chart_start_row = len(glesdmsaa_diff_dist_df) + 5
         chart_position = f"C{chart_start_row}"
         create_distribution_chart(dist_sheet, glesdmsaa_diff_dist_df, chart_title, x_title, y_title, chart_position)
-        
+
     # ============================================================
-    # NEW: Write draw call distribution tables for each backend
+    # Write draw call distribution tables using existing helpers
     # ============================================================
     # Find all draw distribution attributes
-    # Look for attributes ending with '_draw_distribution'
-    draw_attrs = [key for key in df.attrs.keys() if key.endswith('_draw_distribution')]
+    ratio_attrs = [key for key in df.attrs.keys() if key.endswith('_ratio_draw_distribution')]
+    diff_attrs = [key for key in df.attrs.keys() if key.endswith('_diff_draw_distribution')]
     
-    for draw_attr in draw_attrs:
-        # Extract backend name from attribute (remove '_draw_distribution' suffix)
-        backend_name = draw_attr.replace('_draw_distribution', '')
+    # Write ratio draw distribution tables
+    for attr_name in ratio_attrs:
+        summary_col = attr_name.replace('_ratio_draw_distribution', '')
+        dist_df = df.attrs[attr_name]
         
-        # Get the distribution data
-        draw_dist_df = df.attrs.get(draw_attr)
-        draw_columns = df.attrs.get(f'{backend_name}_draw_columns', [])
-        draw_data = df.attrs.get(f'{backend_name}_draw_data', {})
-        
-        if draw_dist_df is not None and not draw_dist_df.empty:
-            # Populate the draw distribution table with weighted counts
-            # Get benchmarks from the main sheet
-            main_df = df[df['Bench'] != 'AVERAGE'] if 'Bench' in df.columns else df
+        if dist_df is not None and not dist_df.empty:
+            dist_sheet_name = sheet_name.replace("_comparison",f"_{summary_col}_draw_dist_ratio")
             
-            # For each draw type, calculate weighted counts for each column
-            for idx, draw_type in enumerate(draw_dist_df['Draw_Type']):
-                for col in draw_columns:
-                    # Extract config name without " (ratio)" suffix
-                    config_name = col.replace(' (ratio)', '')
-                    
-                    # Calculate weighted total for this draw type and column
-                    weighted_total = 0.0
-                    for bench_idx, bench in enumerate(main_df['Bench']):
-                        if bench in draw_data and draw_type in draw_data[bench]:
-                            weight = draw_data[bench][draw_type]
-                            weighted_total += weight
-                    
-                    # Store the weighted total
-                    draw_dist_df.at[idx, config_name] = weighted_total
-            
-            # Generate sheet name using backend name
-            dist_sheet_name = f"{sheet_name}_{backend_name}_draw_dist"[:31]
-            
-            # Write to Excel
-            draw_dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+            # Write the dataframe
+            dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
             dist_sheet = workbook[dist_sheet_name]
             
-            # Format the distribution sheet
-            format_distribution_sheet(dist_sheet, draw_dist_df)
-            print(f"    ✓ Wrote draw call distribution table for backend '{backend_name}' to sheet '{dist_sheet_name}'")
+            # Reuse existing formatting helper
+            format_distribution_sheet(dist_sheet, dist_df)
             
-            # Create chart for draw call distribution
+            print(f"    ✓ Wrote ratio draw distribution table for summary column '{summary_col}' to sheet '{dist_sheet_name}'")
+            
+            # Create chart for ratio draw distribution
             compare_prefix = sheet_name.replace("_comparison","")
-            chart_title = f"{baseline_version} {compare_prefix} Draw Call Distribution ({backend_name} vs glesdmsaa)"
-            x_title = "Draw Type"
+            chart_title = f"{baseline_version} {compare_prefix} Nanobench {summary_col} Draw Call Distribution By Ratio (grdawn_vk vs glesdmsaa)"
+            x_title = "Time Ratio Range"
             y_title = "Weighted Count"
-            
-            # Position chart below the data
-            chart_start_row = len(draw_dist_df) + 5
+            chart_start_row = len(dist_df) + 5
             chart_position = f"C{chart_start_row}"
             
-            # Create chart with draw types on x-axis
-            create_distribution_chart(dist_sheet, draw_dist_df, chart_title, x_title, y_title, chart_position)
-
+            # Reuse existing chart helper (it works the same way - categories from column B, data from columns C+)
+            create_distribution_chart(dist_sheet, dist_df, chart_title, x_title, y_title, chart_position)
+    
+    # Write diff draw distribution tables
+    for attr_name in diff_attrs:
+        summary_col = attr_name.replace('_diff_draw_distribution', '')
+        dist_df = df.attrs[attr_name]
+        
+        if dist_df is not None and not dist_df.empty:
+            dist_sheet_name = sheet_name.replace("_comparison", f"_{summary_col}_draw_dist_diff")
+            
+            # Write the dataframe
+            dist_df.to_excel(writer, sheet_name=dist_sheet_name, index=False)
+            dist_sheet = workbook[dist_sheet_name]
+            
+            # Reuse existing formatting helper
+            format_distribution_sheet(dist_sheet, dist_df)
+            
+            print(f"    ✓ Wrote diff draw distribution table for summary column '{summary_col}' to sheet '{dist_sheet_name}'")
+            
+            # Create chart for diff draw distribution
+            compare_prefix = sheet_name.replace("_comparison","")
+            chart_title = f"{baseline_version} {compare_prefix} Nanobench {summary_col} Draw Call Distribution By Diff(grdawn_vk vs glesdmsaa)"
+            x_title = "Time Diff Range(ms)"
+            y_title = "Weighted Count"
+            chart_start_row = len(dist_df) + 5
+            chart_position = f"C{chart_start_row}"
+            
+            # Reuse existing chart helper
+            create_distribution_chart(dist_sheet, dist_df, chart_title, x_title, y_title, chart_position)
+    
     return df
 
 def apply_table_formatting_to_sheet(sheet, df):
