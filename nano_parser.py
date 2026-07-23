@@ -939,9 +939,12 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_conf
         if ratio_name in headers:
             ratio_col_idx = headers.index(ratio_name) + 1
         else:
-            # Add column before summary columns if possible
+            # Find where to insert the column
+            # We want to insert it before the summary columns if they exist
             summary_cols = [col for col in headers if col and col.startswith('summary of')]
+            
             if summary_cols:
+                # Insert before the first summary column
                 first_summary_idx = headers.index(summary_cols[0]) + 1
                 sheet.insert_cols(first_summary_idx)
                 ratio_col_idx = first_summary_idx
@@ -949,9 +952,22 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_conf
                 # Update headers list
                 headers.insert(first_summary_idx - 1, ratio_name)
             else:
-                # Add at the end
-                ratio_col_idx = len(headers) + 1
-                sheet.cell(row=1, column=ratio_col_idx, value=ratio_name)
+                # No summary columns, insert after all backend columns
+                # Find the last backend column (columns that aren't ID, Bench, or summary)
+                backend_cols = [col for col in headers if col and col not in ['ID', 'Bench'] and not col.startswith('summary of')]
+                if backend_cols:
+                    # Insert after the last backend column
+                    last_backend_idx = headers.index(backend_cols[-1]) + 1
+                    # Insert at the position after the last backend column
+                    sheet.insert_cols(last_backend_idx + 1)
+                    ratio_col_idx = last_backend_idx + 1
+                    sheet.cell(row=1, column=ratio_col_idx, value=ratio_name)
+                    # Update headers list
+                    headers.insert(last_backend_idx, ratio_name)
+                else:
+                    # No backend columns found, add at the end
+                    ratio_col_idx = len(headers) + 1
+                    sheet.cell(row=1, column=ratio_col_idx, value=ratio_name)
         
         # Add Excel formula for each row
         print(f"\nAdding Excel formula for column: {ratio_name}")
@@ -961,7 +977,9 @@ def add_excel_ratio_formulas(writer, comparison_df, dataframes, valid_ratio_conf
             print(f"  = {numerator_name} / {denominator_name}")
         
         formula_count = 0
-        for row_idx in range(2, len(comparison_df) + 2):
+        # Get the number of rows from comparison_df
+        num_rows = len(comparison_df)
+        for row_idx in range(2, num_rows + 2):
             # Create Excel formula
             if calc_type == 'diff':
                 formula = f"={get_column_letter(numerator_col)}{row_idx}-{get_column_letter(denominator_col)}{row_idx}"
