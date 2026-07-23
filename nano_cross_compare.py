@@ -1004,129 +1004,6 @@ def parse_summary_column(summary_data):
     
     return draw_types
 
-def calculate_draw_type_weights_for_benchmark(summary_entry, total_sub_count):
-    """
-    Calculate weighted counts for each draw type for a single benchmark entry.
-    Multiple sub-entries can be separated by ',' or '\n'.
-    Returns a dictionary mapping draw_type to weighted count.
-    """
-    if not isinstance(summary_entry, str) or not summary_entry.startswith('sub'):
-        return {}
-    
-    try:
-        # Split multiple sub-entries by comma or newline
-        # But carefully avoid splitting draw type pairs
-        entry_cleaned = summary_entry.replace('\n', '')
-        
-        # Use a more sophisticated approach to split sub-entries
-        # Find all 'sub' occurrences and split by them
-        sub_entries = []
-        current_pos = 0
-        
-        # Find all positions where 'sub' appears
-        sub_positions = []
-        for match in re.finditer(r'sub\d+\(', entry_cleaned):
-            sub_positions.append(match.start())
-        
-        # If no sub positions found, return
-        if not sub_positions:
-            return {}
-        
-        # Extract each sub-entry
-        for i, pos in enumerate(sub_positions):
-            if i < len(sub_positions) - 1:
-                # Extract from this sub to the next sub
-                next_pos = sub_positions[i + 1]
-                sub_entry = entry_cleaned[pos:next_pos-1].strip()
-            else:
-                # Last sub-entry goes to the end
-                sub_entry = entry_cleaned[pos:].strip()
-            
-            if sub_entry.startswith('sub'):
-                sub_entries.append(sub_entry)
-        
-        if not sub_entries:
-            return {}
-        
-        weighted_counts = {}
-        total_sub_count_actual = 0
-        
-        # First pass: calculate total sub_count
-        for sub_entry in sub_entries:
-            sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
-            if sub_match:
-                total_sub_count_actual += int(sub_match.group(1))
-        
-        if total_sub_count_actual == 0:
-            return {}
-        
-        # Second pass: calculate weights for each draw type
-        for sub_entry in sub_entries:
-            # Extract sub_count
-            sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
-            if not sub_match:
-                continue
-            sub_count = int(sub_match.group(1))
-            
-            # Extract draw data part after colon
-            draw_part = sub_entry.split(':', 1)[1] if ':' in sub_entry else ''
-            
-            # Extract draw_count and optional mismatch_count
-            draw_count_match = re.search(r'\[(\d+)\((\d+)\)\|', draw_part)
-            if draw_count_match:
-                draw_count = int(draw_count_match.group(1))
-                mismatch_count = int(draw_count_match.group(2))
-            else:
-                # No mismatch count
-                draw_count_match = re.search(r'\[(\d+)\|', draw_part)
-                if not draw_count_match:
-                    continue
-                draw_count = int(draw_count_match.group(1))
-                mismatch_count = 0
-            
-            # Extract draw_type:count pairs
-            draw_data = draw_part.split('|', 1)[1] if '|' in draw_part else ''
-            
-            # Remove the trailing ']' if present
-            if draw_data.endswith(']'):
-                draw_data = draw_data[:-1]
-            
-            if not draw_data:
-                continue
-            
-            # Parse draw_type:count pairs (comma separated)
-            pairs = draw_data.split(',')
-            for pair in pairs:
-                pair = pair.strip()
-                if ':' in pair:
-                    draw_type, count_str = pair.split(':', 1)
-                    draw_type = draw_type.strip()
-                    count_str = count_str.strip()
-                    try:
-                        count = int(count_str)
-                        # Weight: (type_count/draw_count) * (sub_count/total_sub_count)
-                        if draw_count > 0 and total_sub_count_actual > 0:
-                            weight = (count / draw_count) * (sub_count / total_sub_count_actual)
-                            if draw_type in weighted_counts:
-                                weighted_counts[draw_type] += weight
-                            else:
-                                weighted_counts[draw_type] = weight
-                    except ValueError:
-                        # Skip if count is not a valid integer
-                        continue
-        
-        if weighted_counts:
-            total_weight = sum(weighted_counts.values())
-            tolerance = 1e-9
-            if abs(total_weight - 1.0) > tolerance:
-                print(f"    ⚠️ WARNING: Weighted counts sum to {total_weight:.10f}, expected 1.0")
-                # Normalize to ensure sum equals 1
-        
-        return weighted_counts
-        
-    except Exception as e:
-        return {}
-
 def get_draw_type_data_from_summary(df, summary_columns):
     """
     Extract draw type data from summary columns.
@@ -1136,15 +1013,19 @@ def get_draw_type_data_from_summary(df, summary_columns):
         'backend': backend_name,
         'data': {benchmark: {draw_type: weighted_count, ...}}
       }
+    Skips sub-entries where draw_count is 0 and reports them.
+    Also reports cases where weighted sum != 1.
     """
     if not summary_columns:
         return {}
     
     draw_type_data = {}
+    zero_draw_entries = []  # Track entries with zero draw count
+    invalid_sum_entries = []  # Track entries where weighted sum != 1
+    invalid_format_entries = []  # Track entries with invalid format
     
     for col_name, col_values in summary_columns.items():
         # Extract backend name from column name
-        # Column names like "grdawn_vk summary", "glesdmsaa summary", etc.
         backend_name = col_name.replace(' summary', '').replace(' Summary', '').strip()
         
         # Check if this column contains draw data
@@ -1167,39 +1048,151 @@ def get_draw_type_data_from_summary(df, summary_columns):
             if idx < len(col_values):
                 summary_entry = col_values[idx]
                 if isinstance(summary_entry, str) and 'sub' in summary_entry:
-                    # Calculate total sub_count for this benchmark
-                    # Extract all sub_count values from the entry
-                    # Handle both comma and newline separated sub-entries
-                    entry_cleaned = summary_entry.replace('\n', ',')
-                    
                     # Find all sub entries
                     sub_entries = []
                     sub_positions = []
-                    for match in re.finditer(r'sub\d+\(', entry_cleaned):
+                    for match in re.finditer(r'sub\d+\(', summary_entry):
                         sub_positions.append(match.start())
                     
                     if sub_positions:
                         for i, pos in enumerate(sub_positions):
                             if i < len(sub_positions) - 1:
+                                # Extract from this sub to the next sub
                                 next_pos = sub_positions[i + 1]
-                                sub_entry = entry_cleaned[pos:next_pos].strip()
+                                sub_entry = summary_entry[pos:next_pos].strip()
+                                
+                                # Clean up trailing separators
+                                while sub_entry.endswith(',') or sub_entry.endswith('\n'):
+                                    sub_entry = sub_entry[:-1]
+                                # Clean up leading separators as well
+                                while sub_entry.startswith(',') or sub_entry.startswith('\n'):
+                                    sub_entry = sub_entry[1:]
+                                
+                                if sub_entry.startswith('sub'):
+                                    sub_entries.append(sub_entry)
                             else:
-                                sub_entry = entry_cleaned[pos:].strip()
-                            if sub_entry.startswith('sub'):
-                                sub_entries.append(sub_entry)
+                                # Last sub-entry goes to the end
+                                sub_entry = summary_entry[pos:].strip()
+                                # Clean up trailing separators
+                                while sub_entry.endswith(',') or sub_entry.endswith('\n'):
+                                    sub_entry = sub_entry[:-1]
+                                if sub_entry.startswith('sub'):
+                                    sub_entries.append(sub_entry)
                     
                     if sub_entries:
                         total_sub_count = 0
-                        for sub_entry in sub_entries:
-                            sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
-                            if sub_match:
-                                total_sub_count += int(sub_match.group(1))
+                        valid_sub_entries = []
                         
-                        if total_sub_count > 0:
-                            # Calculate weighted counts for each draw type
-                            weighted_counts = calculate_draw_type_weights_for_benchmark(summary_entry, total_sub_count)
+                        # First pass: check draw_count and collect valid sub-entries
+                        for sub_entry in sub_entries:
+                            # Extract draw_count
+                            # Format 1: "[5(0)|A:1,B:2]" (has '|' when draw_count > 0)
+                            # Format 2: "[0]" (no '|' when draw_count == 0)
+                            draw_count_match = re.search(r'\[(\d+)\((\d+)\)\|', sub_entry) or re.search(r'\[(\d+)\|', sub_entry) or re.search(r'\[(\d+)\]',sub_entry)
+                            if draw_count_match:
+                                draw_count = int(draw_count_match.group(1))
+                                # Skip if draw_count is 0 and report it
+                                if draw_count == 0:
+                                    zero_draw_entries.append({
+                                        'benchmark': bench,
+                                        'backend': backend_name,
+                                        'summary_column': col_name,
+                                        'sub_entry': sub_entry,
+                                        'draw_count': 0
+                                    })
+                                    continue  # Skip this sub-entry
+                                elif draw_count > 0:
+                                    valid_sub_entries.append(sub_entry)
+                                    sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+                                    if sub_match:
+                                        total_sub_count += int(sub_match.group(1))
+                            else:
+                                invalid_format_entries.append({
+                                    'benchmark': bench,
+                                    'backend': backend_name,
+                                    'summary_column': col_name,
+                                    'sub_entry': sub_entry,
+                                    'reason': 'Invalid format - missing required structure'
+                                })
+                        
+                        if total_sub_count > 0 and valid_sub_entries:
+                            # Initialize weighted_counts dictionary for this benchmark
+                            weighted_counts = {}
+                            
+                            # Process each valid sub-entry and accumulate weights
+                            for sub_entry in valid_sub_entries:
+                                # Extract sub_count
+                                sub_match = re.search(r'sub\d+\((\d+)\)', sub_entry)
+                                if not sub_match:
+                                    continue
+                                sub_count = int(sub_match.group(1))
+                                
+                                # Extract draw data part after colon
+                                draw_part = sub_entry.split(':', 1)[1] if ':' in sub_entry else ''
+                                
+                                # Extract draw_count (already validated > 0)
+                                draw_count_match = re.search(r'\[(\d+)\((\d+)\)\|', draw_part) or re.search(r'\[(\d+)\|', draw_part)
+                                if not draw_count_match:
+                                    continue
+                                draw_count = int(draw_count_match.group(1))
+                                
+                                # Extract draw_type:count pairs
+                                draw_data = draw_part.split('|', 1)[1] if '|' in draw_part else ''
+                                
+                                # Remove the trailing ']' if present
+                                if draw_data.endswith(']'):
+                                    draw_data = draw_data[:-1]
+                                
+                                if not draw_data:
+                                    continue
+                                
+                                #print(f"PROCESSING {draw_data}")
+                                
+                                # Parse draw_type:count pairs (comma separated)
+                                pairs = draw_data.split(',')
+                                for pair in pairs:
+                                    pair = pair.strip()
+                                    if ':' in pair:
+                                        draw_type, count_str = pair.split(':', 1)
+                                        draw_type = draw_type.strip()
+                                        count_str = count_str.strip()
+                                        try:
+                                            count = int(count_str)
+                                            # Weight: (type_count/draw_count) * (sub_count/total_sub_count)
+                                            if draw_count > 0 and total_sub_count > 0:
+                                                weight = (count / draw_count) * (sub_count / total_sub_count)
+                                                # Accumulate weight for this draw type
+                                                if draw_type in weighted_counts:
+                                                    weighted_counts[draw_type] += weight
+                                                else:
+                                                    weighted_counts[draw_type] = weight
+                                        except ValueError:
+                                            continue
+                            
+                            # After processing all sub-entries, check if sum equals 1
                             if weighted_counts:
+                                total_weight = sum(weighted_counts.values())
+                                tolerance = 1e-9
+                                if abs(total_weight - 1.0) > tolerance:
+                                    invalid_sum_entries.append({
+                                        'benchmark': bench,
+                                        'backend': backend_name,
+                                        'summary_column': col_name,
+                                        'weighted_counts': weighted_counts,
+                                        'total_weight': total_weight,
+                                        'summary_entry': summary_entry,
+                                        'num_sub_entries': len(valid_sub_entries)
+                                    })
+                                # Store the accumulated weighted counts for this benchmark
                                 bench_data[bench] = weighted_counts
+                    else:
+                        zero_draw_entries.append({
+                                        'benchmark': bench,
+                                        'backend': backend_name,
+                                        'summary_column': col_name,
+                                        'sub_entry': sub_entry,
+                                        'draw_count': 0
+                                    })
         
         if bench_data:
             draw_type_data[col_name] = {
@@ -1207,6 +1200,83 @@ def get_draw_type_data_from_summary(df, summary_columns):
                 'data': bench_data
             }
             print(f"    ✓ Extracted draw type data from '{col_name}' (backend: {backend_name})")
+    
+    # Report zero draw count entries
+    if zero_draw_entries:
+        print(f"\n    ⚠️ Found {len(zero_draw_entries)} sub-entries with draw_count=0 (skipped):")
+        # Group by backend and benchmark for cleaner reporting
+        grouped_entries = {}
+        for entry in zero_draw_entries:
+            key = f"{entry['backend']} - {entry['benchmark']}"
+            if key not in grouped_entries:
+                grouped_entries[key] = []
+            grouped_entries[key].append(entry['sub_entry'])
+        
+        for key, entries in grouped_entries.items():
+            print(f"      - {key}: {len(entries)} zero-draw sub-entries")
+            # Show first few entries as examples
+            for i, sub_entry in enumerate(entries[:3]):
+                print(f"          {sub_entry[:100]}...")  # Truncate long entries
+            if len(entries) > 3:
+                print(f"          ... and {len(entries) - 3} more")
+    
+        # Report invalid format entries
+    if invalid_format_entries:
+        print(f"\n    ⚠️ Found {len(invalid_format_entries)} sub-entries with invalid format:")
+        # Group by backend and reason for cleaner reporting
+        grouped_invalid = {}
+        for entry in invalid_format_entries:
+            key = f"{entry['backend']}"
+            if key not in grouped_invalid:
+                grouped_invalid[key] = []
+            grouped_invalid[key].append(entry)
+        
+        for backend, entries in grouped_invalid.items():
+            print(f"      - Backend '{backend}': {len(entries)} invalid format entries")
+            # Group by reason within backend
+            reason_groups = {}
+            for entry in entries:
+                reason = entry['reason']
+                if reason not in reason_groups:
+                    reason_groups[reason] = []
+                reason_groups[reason].append(entry)
+            
+            for reason, reason_entries in reason_groups.items():
+                print(f"          Reason: {reason}")
+                # Show first few entries as examples
+                for i, entry in enumerate(reason_entries[:3]):
+                    print(f"            Benchmark: {entry['benchmark']}")
+                    print(f"            Sub-entry: {entry['sub_entry'][:100]}...")
+                if len(reason_entries) > 3:
+                    print(f"            ... and {len(reason_entries) - 3} more")
+    
+    # Report invalid sum entries
+    if invalid_sum_entries:
+        print(f"\n    ⚠️ Found {len(invalid_sum_entries)} entries where weighted sum != 1:")
+        # Group by backend for cleaner reporting
+        grouped_invalid = {}
+        for entry in invalid_sum_entries:
+            key = f"{entry['backend']}"
+            if key not in grouped_invalid:
+                grouped_invalid[key] = []
+            grouped_invalid[key].append(entry)
+        
+        for backend, entries in grouped_invalid.items():
+            print(f"      - Backend '{backend}': {len(entries)} invalid sum entries")
+            # Show first few entries as examples
+            for i, entry in enumerate(entries[:5]):
+                print(f"          Benchmark: {entry['benchmark']}")
+                print(f"            Total weight: {entry['total_weight']:.10f} (expected 1.0)")
+                print(f"            Number of sub-entries: {entry['num_sub_entries']}")
+                # Show the draw types and their weights
+                draw_types_str = ', '.join([f"{k}: {v:.4f}" for k, v in list(entry['weighted_counts'].items())[:5]])
+                if len(entry['weighted_counts']) > 5:
+                    draw_types_str += f", ... and {len(entry['weighted_counts']) - 5} more"
+                print(f"            Draw types: {draw_types_str}")
+                # Show the original summary entry (truncated)
+                #print(f"            Summary: {entry['summary_entry'][:150]}...")
+            if len(entries) > 5:
+                print(f"          ... and {len(entries) - 5} more")
     
     return draw_type_data
 
