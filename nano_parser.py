@@ -309,10 +309,16 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
     # Pattern to match flush events
     flush_pattern = re.compile(r'sk_gpu_test::TestContext::flushAndWaitOnSync')
     
+    # Track benchmark categories for Ganesh
+    zero_draw_benchmarks = []        # Benchmarks with all submissions having draw_count == 0
+    has_zero_draw_benchmarks = []    # Benchmarks with at least one submission containing zero draw count
+    
     for bench in benches:
         sanitized_bench = sanitize_bench_name_for_file(bench)
         json_file = folder / f"{sanitized_bench}.json"
         submissions = []
+        all_draw_count_zero = True
+        has_zero_draw_submission = False
         
         if json_file.exists():
             try:
@@ -393,6 +399,25 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                         submissions.append(state[0])
                     state[0] = None
                 
+                # Check for zero draw submissions
+                for sub in submissions:
+                    draw_count = len(sub['draw_types'])
+                    if draw_count > 0:
+                        all_draw_count_zero = False
+                    else:
+                        has_zero_draw_submission = True
+                
+                # Categorize the benchmark
+                if not submissions:
+                    # No submissions at all - treat as zero draws
+                    zero_draw_benchmarks.append(bench)
+                elif all_draw_count_zero:
+                    # All submissions have draw_count == 0
+                    zero_draw_benchmarks.append(bench)
+                elif has_zero_draw_submission and not all_draw_count_zero:
+                    # Has at least one zero draw submission but not all
+                    has_zero_draw_benchmarks.append(bench)
+                
                 if submissions:
                     # Group submissions by draw type pattern
                     config_groups = {}
@@ -427,20 +452,20 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                     # Build summary parts
                     summary_parts = []
                     
-                    # Format ALL configs with unified format
+                    # Format ALL configs as sub#id(count)[summary]
                     for idx, (config_key, data) in enumerate(sorted_configs):
                         draw_count = data['draw_count']
                         count = data['count']
                         type_counts = data['type_counts']
                         
-                        # Build summary parts inner with draw type:count format
+                        # Format the draw type summary with name:count format (same as Graphite)
                         summary_parts_inner = []
                         if type_counts:
                             sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
                             for draw_type, cnt in sorted_types:
                                 summary_parts_inner.append(f"{draw_type}:{cnt}")
                         
-                        # Build the submission summary string (always report draw count for Ganesh)
+                        # Build the submission summary string
                         if draw_count == 0:
                             # No draws
                             summary_part = f"sub{idx+1}({count}):[{draw_count}]"
@@ -459,6 +484,30 @@ def analyze_ftrace_files_ganesh(folder_path, benches, folder_name):
                 draw_types_map[bench] = f"Error: {str(e)[:30]}"
         else:
             draw_types_map[bench] = f"No JSON"
+    
+    # Print categorized error summary for Ganesh
+    print("\n" + "="*60)
+    print("📊 GANESH TRACE ANALYSIS SUMMARY:")
+    print("="*60)
+    
+    # Category 1: Benchmarks with all submissions having draw_count == 0
+    if zero_draw_benchmarks:
+        print(f"\n❌ ZERO DRAWS (ALL) ({len(zero_draw_benchmarks)} benchmarks):")
+        print("   Benchmarks where all submissions have draw_count == 0")
+        for bench in sorted(zero_draw_benchmarks):
+            print(f"     • {bench}")
+    
+    # Category 2: Benchmarks with at least one zero draw submission
+    if has_zero_draw_benchmarks:
+        print(f"\n⚠️  ZERO DRAWS (SOME) ({len(has_zero_draw_benchmarks)} benchmarks):")
+        print("   Benchmarks with at least one submission containing zero draw count")
+        for bench in sorted(has_zero_draw_benchmarks):
+            print(f"     • {bench}")
+    
+    if not (zero_draw_benchmarks or has_zero_draw_benchmarks):
+        print("\n✅ All benchmarks processed successfully with no zero draw issues!")
+    
+    print("\n" + "="*60 + "\n")
     
     return draw_types_map
 
@@ -503,16 +552,17 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                     
                     if isinstance(trace_data, dict):
                         func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
-                        timestamp = trace_data.get('timestamp', 0)
+                        timestamp = trace_data.get('ts', 0)
                         
                         if func_name:
                             # Start of submission
                             if submit_pattern.search(func_name):
-                                state[0] = {
-                                    'start_time': timestamp,
-                                    'renderers': [],
-                                    'record_count': 0
-                                }
+                                if state[0] is None:
+                                    state[0] = {
+                                        'start_time': timestamp,
+                                        'renderers': [],
+                                        'record_count': 0
+                                    }
                                 # Note: state[1] (record_state) is NOT reset here
                                 # It persists across submissions
                                 state[2] = False  # Reset flush_all flag
@@ -522,6 +572,7 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                                 state[0]['snap_time'] = timestamp
                                 state[0]['end_time'] = timestamp
                                 state[2] = True  # Set flush_all flag
+
                             
                             # Draw pass event - parse draw count only
                             elif draw_pass_pattern.search(func_name) and state[0] is not None:
@@ -543,57 +594,52 @@ def analyze_ftrace_files_graphite(folder_path, benches):
                                     has_zero_draw_submission = True
                                 
                                 # Process renderers from record_state based on flush_all flag
-                                record_count = draw_count
                                 if state[2]:
-                                    # flush_all is True: only keep the last draw_count renderers for this submission
+                                    draw_count_total = draw_count + state[0]['record_count']
                                     record_count = len(state[1])
-                                    if len(state[1]) > draw_count:
+                                    # flush_all is True: only keep the last draw_count renderers for this submission
+                                    if record_count > draw_count_total:
                                         # This is a mismatch
                                         mismatch_count += 1
                                         # Check if this is a zero record issue (draw_count == 0)
-                                        if draw_count == 0:
+                                        if draw_count_total == 0:
                                             has_zero_record_issue = True
                                         # Only keep the last draw_count renderers
-                                        state[1] = state[1][-draw_count:] if draw_count > 0 else []
+                                        state[1] = state[1][-draw_count_total:] if draw_count_total > 0 else []
                                     # Get the renderers for this submission
                                     submission_renderers = state[1][:]
+                                    state[0]['record_count'] = record_count
+                                
+                                    # Assign renderers to submission_state
+                                    state[0]['renderers'] = submission_renderers
+                                    
+                                    submissions.append(state[0])
+                                    # Initialize new submission immediately after appending
+                                    state[0] = {
+                                        'start_time': timestamp,
+                                        'renderers': [],
+                                        'record_count': 0
+                                    }
+                                    state[2] = False
                                     # Clear the record_state completely (flush_all means we don't keep any renderers)
                                     state[1] = []
                                 else:
-                                    # flush_all is False: keep extra renderers in record_state for future submissions
-                                    # Get the last draw_count renderers for this submission
-                                    submission_renderers = state[1][-draw_count:] if draw_count > 0 and state[1] else []
-                                    # Keep extra renderers (before the last draw_count) in the record_state
-                                    if len(state[1]) > draw_count:
-                                        state[1] = state[1][:-draw_count] if draw_count > 0 else []
-                                    else:
-                                        state[1] = []
-                                    # Note: state[1] now contains the extra renderers for future submissions
-                                
-                                state[0]['record_count'] = record_count
-                                
-                                # Assign renderers to submission_state
-                                state[0]['renderers'] = submission_renderers
-                                
-                                submissions.append(state[0])
-                                # Initialize new submission immediately after appending
-                                state[0] = {
-                                    'start_time': timestamp,
-                                    'renderers': [],
-                                    'record_count': 0
-                                }
-                                state[2] = False
+                                    # use this field as temporay holder to acumulate draw_count
+                                    state[0]['record_count'] += draw_count
+                                    # Note: state[1] doesn't get touched.
                             
                             # Check for renderer in event arguments - this controls record_state
                             args = trace_data.get('args', {})
                             for key, value in args.items():
                                 if key.lower().startswith('renderer'):
+                                    state[2] = False  # Reset flush_all flag during record phase
                                     renderer_name = str(value)
                                     # Only append if we have a submission state
                                     if state[0] is not None:
                                         # Append to record_state (state[1])
                                         state[1].append(renderer_name)
                                     break
+                                   
                         
                         for key, value in trace_data.items():
                             if isinstance(value, (dict, list)):
@@ -709,16 +755,16 @@ def analyze_ftrace_files_graphite(folder_path, benches):
         for bench in sorted(zero_draw_benchmarks):
             print(f"     • {bench}")
     
-    # Category 2: Benchmarks with at least one zero draw submission
+    # Category 2: Benchmarks with at least one zero record submission
     if has_zero_draw_benchmarks:
         print(f"\n⚠️  ZERO DRAWS (SOME) ({len(has_zero_draw_benchmarks)} benchmarks):")
         print("   Benchmarks with at least one submission containing zero draw count")
         for bench in sorted(has_zero_draw_benchmarks):
             print(f"     • {bench}")
     
-    # Category 3: Benchmarks with zero records (draw_count == 0 but extra renderers exist)
+    # Category 3: Benchmarks with zero draw (draw_count == 0 but extra renderers exist)
     if zero_record_benchmarks:
-        print(f"\n⚠️  ZERO RECORDS ({len(zero_record_benchmarks)} benchmarks):")
+        print(f"\n⚠️  ZERO DRAWS NON-ZERO RECORDS({len(zero_record_benchmarks)} benchmarks):")
         print("   Benchmarks where draw_count == 0 but extra renderers were removed")
         for bench in sorted(zero_record_benchmarks):
             print(f"     • {bench}")
