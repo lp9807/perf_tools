@@ -8,7 +8,7 @@ If a folder parameter is not a valid directory, trace parser logic will be skipp
 
 import sys
 import os
-import json
+import json, ijson
 import re
 import pandas as pd
 from pathlib import Path
@@ -527,6 +527,9 @@ def analyze_ftrace_files_graphite(folder_path, benches):
     mismatched_benchmarks = {}       # Benchmarks with draw_count > 0 and renderer_count != draw_count
     has_zero_draw_benchmarks = []    # Benchmarks with at least one submission containing zero draw count
     
+    # Threshold for streaming (in bytes) - 100MB
+    STREAMING_THRESHOLD = 500 * 1024 * 1024
+    
     for bench in benches:
         sanitized_bench = sanitize_bench_name_for_file(bench)
         json_file = folder / f"{sanitized_bench}.json"
@@ -537,209 +540,234 @@ def analyze_ftrace_files_graphite(folder_path, benches):
         has_zero_draw_submission = False
         
         if json_file.exists():
-            try:
-                with open(json_file, 'r') as f:
-                    data = json.load(f)
+            # State: [submission_state, record_state, flush_all_flag]
+            # submission_state: current submission being built (dict with renderers, draw_count)
+            # record_state: accumulated renderers from renderer events (list)
+            # flush_all_flag: whether snap event has occurred
+            state = [None, [], False]
+            
+            def process_trace(trace_data):
+                nonlocal mismatch_count, has_zero_record_issue, all_draw_count_zero, has_zero_draw_submission
                 
-                # State: [submission_state, record_state, flush_all_flag]
-                # submission_state: current submission being built (dict with renderers, draw_count)
-                # record_state: accumulated renderers from renderer events (list)
-                # flush_all_flag: whether snap event has occurred
-                state = [None, [], False]
-                
-                def process_trace(trace_data):
-                    nonlocal mismatch_count, has_zero_record_issue, all_draw_count_zero, has_zero_draw_submission
+                if isinstance(trace_data, dict):
+                    func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
+                    timestamp = trace_data.get('ts', 0)
                     
-                    if isinstance(trace_data, dict):
-                        func_name = trace_data.get('func') or trace_data.get('function') or trace_data.get('name')
-                        timestamp = trace_data.get('ts', 0)
+                    if func_name:
+                        # Start of submission
+                        if submit_pattern.search(func_name):
+                            if state[0] is None:
+                                state[0] = {
+                                    'start_time': timestamp,
+                                    'renderers': [],
+                                    'record_count': 0
+                                }
+                            # Note: state[1] (record_state) is NOT reset here
+                            # It persists across submissions
+                            state[2] = False  # Reset flush_all flag
                         
-                        if func_name:
-                            # Start of submission
-                            if submit_pattern.search(func_name):
-                                if state[0] is None:
-                                    state[0] = {
-                                        'start_time': timestamp,
-                                        'renderers': [],
-                                        'record_count': 0
-                                    }
-                                # Note: state[1] (record_state) is NOT reset here
-                                # It persists across submissions
-                                state[2] = False  # Reset flush_all flag
-                            
-                            # Snap event - set flush_all flag to True
-                            elif snap_pattern.search(func_name) and state[0] is not None:
-                                state[0]['snap_time'] = timestamp
-                                state[0]['end_time'] = timestamp
-                                state[2] = True  # Set flush_all flag
+                        # Snap event - set flush_all flag to True
+                        elif snap_pattern.search(func_name) and state[0] is not None:
+                            state[0]['snap_time'] = timestamp
+                            state[0]['end_time'] = timestamp
+                            state[2] = True  # Set flush_all flag
 
-                            
-                            # Draw pass event - parse draw count only
-                            elif draw_pass_pattern.search(func_name) and state[0] is not None:
-                                draw_count = 0
-                                args = trace_data.get('args', {})
-                                for key, value in args.items():
-                                    if 'draw count' in key.lower() or 'draw_count' in key.lower():
-                                        try:
-                                            draw_count = int(value)
-                                            break
-                                        except:
-                                            pass
-                                
-                                # Check if this submission has draw_count > 0
-                                if draw_count > 0:
-                                    all_draw_count_zero = False
-                                else:
-                                    # This submission has zero draw count
-                                    has_zero_draw_submission = True
-                                
-                                # Process renderers from record_state based on flush_all flag
-                                if state[2]:
-                                    draw_count_total = draw_count + state[0]['record_count']
-                                    record_count = len(state[1])
-                                    # flush_all is True: only keep the last draw_count renderers for this submission
-                                    if record_count > draw_count_total:
-                                        # This is a mismatch
-                                        mismatch_count += 1
-                                        # Check if this is a zero record issue (draw_count == 0)
-                                        if draw_count_total == 0:
-                                            has_zero_record_issue = True
-                                        # Only keep the last draw_count renderers
-                                        state[1] = state[1][-draw_count_total:] if draw_count_total > 0 else []
-                                    # Get the renderers for this submission
-                                    submission_renderers = state[1][:]
-                                    state[0]['record_count'] = record_count
-                                
-                                    # Assign renderers to submission_state
-                                    state[0]['renderers'] = submission_renderers
-                                    
-                                    submissions.append(state[0])
-                                    # Initialize new submission immediately after appending
-                                    state[0] = {
-                                        'start_time': timestamp,
-                                        'renderers': [],
-                                        'record_count': 0
-                                    }
-                                    state[2] = False
-                                    # Clear the record_state completely (flush_all means we don't keep any renderers)
-                                    state[1] = []
-                                else:
-                                    # use this field as temporay holder to acumulate draw_count
-                                    state[0]['record_count'] += draw_count
-                                    # Note: state[1] doesn't get touched.
-                            
-                            # Check for renderer in event arguments - this controls record_state
+                        
+                        # Draw pass event - parse draw count only
+                        elif draw_pass_pattern.search(func_name) and state[0] is not None:
+                            draw_count = 0
                             args = trace_data.get('args', {})
                             for key, value in args.items():
-                                if key.lower().startswith('renderer'):
-                                    state[2] = False  # Reset flush_all flag during record phase
-                                    renderer_name = str(value)
-                                    # Only append if we have a submission state
-                                    if state[0] is not None:
-                                        # Append to record_state (state[1])
-                                        state[1].append(renderer_name)
-                                    break
-                                   
-                        
-                        for key, value in trace_data.items():
-                            if isinstance(value, (dict, list)):
-                                process_trace(value)
-                    elif isinstance(trace_data, list):
-                        for item in trace_data:
-                            process_trace(item)
-                
-                process_trace(data)
-                
-                # Categorize the benchmark based on results
-                if not submissions:
-                    # No submissions at all - treat as zero draws
-                    zero_draw_benchmarks.append(bench)
-                elif all_draw_count_zero:
-                    # All submissions have draw_count == 0
-                    zero_draw_benchmarks.append(bench)
-                elif has_zero_record_issue:
-                    # Has zero record issue (draw_count == 0 with extra renderers)
-                    zero_record_benchmarks.append(bench)
-                elif mismatch_count > 0:
-                    # Has mismatches (draw_count > 0 and renderer_count != draw_count)
-                    mismatched_benchmarks[bench] = mismatch_count
-                
-                # Track benchmarks with at least one zero draw submission
-                if has_zero_draw_submission and not all_draw_count_zero:
-                    has_zero_draw_benchmarks.append(bench)
-                
-                if submissions:
-                    # Group submissions by config
-                    config_groups = {}
-                    
-                    for sub in submissions:
-                        renderer_count = len(sub['renderers'])
-                        record_count = sub.get('record_count', 0)
-                        
-                        # Create config key
-                        config_key = f"m{renderer_count}_d{record_count}"
-                        
-                        if config_key not in config_groups:
-                            config_groups[config_key] = {
-                                'count': 0,
-                                'renderer_count': renderer_count,
-                                'record_count': record_count,
-                                'renderers': sub['renderers'][:] if sub['renderers'] else []
-                            }
-                        config_groups[config_key]['count'] += 1
-                    
-                    # Sort configs by count descending
-                    sorted_configs = sorted(config_groups.items(), key=lambda x: x[1]['count'], reverse=True)
-                    
-                    # Build summary parts
-                    summary_parts = []
-                    
-                    # Format ALL configs as sub#id: N[summary]
-                    for idx, (config_key, data) in enumerate(sorted_configs):
-                        renderer_count = data['renderer_count']
-                        record_count = data['record_count']
-                        count = data['count']
-                        renderers = data['renderers']
-                        
-                        # Count renderers with their frequencies
-                        renderer_counts = {}
-                        for r in renderers:
-                            renderer_counts[r] = renderer_counts.get(r, 0) + 1
-                        
-                        # Build summary parts inner with name:count format
-                        summary_parts_inner = []
-                        if renderer_counts:
-                            sorted_renderers = sorted(renderer_counts.items(), key=lambda x: x[1], reverse=True)
-                            for name, cnt in sorted_renderers:
-                                summary_parts_inner.append(f"{name}:{cnt}")
-                        
-                        # Build the submission summary string
-                        if renderer_count == 0:
-                            # No renderers - only report count
-                            if renderer_count == record_count:
-                                # Renderer count matches draw count
-                                summary_part = f"sub{idx+1}({count}):[{renderer_count}]"
+                                if 'draw count' in key.lower() or 'draw_count' in key.lower():
+                                    try:
+                                        draw_count = int(value)
+                                        break
+                                    except:
+                                        pass
+                            
+                            # Check if this submission has draw_count > 0
+                            if draw_count > 0:
+                                all_draw_count_zero = False
                             else:
-                                # Renderer count doesn't match draw count
-                                summary_part = f"sub{idx+1}({count}):[{renderer_count}({record_count})]"
+                                # This submission has zero draw count
+                                has_zero_draw_submission = True
+                            
+                            # Process renderers from record_state based on flush_all flag
+                            if state[2]:
+                                draw_count_total = draw_count + state[0]['record_count']
+                                record_count = len(state[1])
+                                # flush_all is True: only keep the last draw_count renderers for this submission
+                                if record_count > draw_count_total:
+                                    # This is a mismatch
+                                    mismatch_count += 1
+                                    # Check if this is a zero record issue (draw_count == 0)
+                                    if draw_count_total == 0:
+                                        has_zero_record_issue = True
+                                    # Only keep the last draw_count renderers
+                                    state[1] = state[1][-draw_count_total:] if draw_count_total > 0 else []
+                                # Get the renderers for this submission
+                                submission_renderers = state[1][:]
+                                state[0]['record_count'] = record_count
+                            
+                                # Assign renderers to submission_state
+                                state[0]['renderers'] = submission_renderers
+                                
+                                submissions.append(state[0])
+                                # Initialize new submission immediately after appending
+                                state[0] = {
+                                    'start_time': timestamp,
+                                    'renderers': [],
+                                    'record_count': 0
+                                }
+                                state[2] = False
+                                # Clear the record_state completely (flush_all means we don't keep any renderers)
+                                state[1] = []
+                            else:
+                                # use this field as temporay holder to acumulate draw_count
+                                state[0]['record_count'] += draw_count
+                                # Note: state[1] doesn't get touched.
+                        
+                        # Check for renderer in event arguments - this controls record_state
+                        args = trace_data.get('args', {})
+                        for key, value in args.items():
+                            if key.lower().startswith('renderer'):
+                                state[2] = False  # Reset flush_all flag during record phase
+                                renderer_name = str(value)
+                                # Only append if we have a submission state
+                                if state[0] is not None:
+                                    # Append to record_state (state[1])
+                                    state[1].append(renderer_name)
+                                break
+                               
+                    
+                    for key, value in trace_data.items():
+                        if isinstance(value, (dict, list)):
+                            process_trace(value)
+                elif isinstance(trace_data, list):
+                    for item in trace_data:
+                        process_trace(item)
+            
+            # Check file size to decide between streaming and standard loading
+            file_size = json_file.stat().st_size
+            use_streaming_for_file = file_size > STREAMING_THRESHOLD
+            
+            if use_streaming_for_file:
+                # Streaming JSON parsing with ijson for large files
+                print(f"   📊 {bench}: using streaming mode ({file_size / (1024*1024):.1f}MB)")
+                
+                try:
+                    with open(json_file, 'rb') as f:
+                        # Use ijson's items to parse top-level objects
+                        # Parse the entire file as a list of objects
+                        for obj in ijson.items(f, 'item', use_float=True):
+                            if isinstance(obj, dict):
+                                process_trace(obj)
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    if isinstance(item, dict):
+                                        process_trace(item)
+                except (Exception, ijson.JSONError) as e:
+                    draw_types_map[bench] = f"Error: {str(e)[:30]}"
+                    print(f"   ⚠️  {bench}: ijson parsing failed: {str(e)} ")
+                    pass
+            else:
+                try:
+                    # Original loading logic - unchanged
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                        process_trace(data)
+                except Exception as e:
+                    draw_types_map[bench] = f"Error: {str(e)[:30]}"
+                    print(f"   ⚠️  {bench}: json parse file failed {json_file}: {str(e)}")
+                    pass
+            
+            # Categorize the benchmark based on results
+            if not submissions:
+                # No submissions at all - treat as zero draws
+                zero_draw_benchmarks.append(bench)
+            elif all_draw_count_zero:
+                # All submissions have draw_count == 0
+                zero_draw_benchmarks.append(bench)
+            elif has_zero_record_issue:
+                # Has zero record issue (draw_count == 0 with extra renderers)
+                zero_record_benchmarks.append(bench)
+            elif mismatch_count > 0:
+                # Has mismatches (draw_count > 0 and renderer_count != draw_count)
+                mismatched_benchmarks[bench] = mismatch_count
+            
+            # Track benchmarks with at least one zero draw submission
+            if has_zero_draw_submission and not all_draw_count_zero:
+                has_zero_draw_benchmarks.append(bench)
+            
+            if submissions:
+                # Group submissions by config
+                config_groups = {}
+                
+                for sub in submissions:
+                    renderer_count = len(sub['renderers'])
+                    record_count = sub.get('record_count', 0)
+                    
+                    # Create config key
+                    config_key = f"m{renderer_count}_d{record_count}"
+                    
+                    if config_key not in config_groups:
+                        config_groups[config_key] = {
+                            'count': 0,
+                            'renderer_count': renderer_count,
+                            'record_count': record_count,
+                            'renderers': sub['renderers'][:] if sub['renderers'] else []
+                        }
+                    config_groups[config_key]['count'] += 1
+                
+                # Sort configs by count descending
+                sorted_configs = sorted(config_groups.items(), key=lambda x: x[1]['count'], reverse=True)
+                
+                # Build summary parts
+                summary_parts = []
+                
+                # Format ALL configs as sub#id: N[summary]
+                for idx, (config_key, data) in enumerate(sorted_configs):
+                    renderer_count = data['renderer_count']
+                    record_count = data['record_count']
+                    count = data['count']
+                    renderers = data['renderers']
+                    
+                    # Count renderers with their frequencies
+                    renderer_counts = {}
+                    for r in renderers:
+                        renderer_counts[r] = renderer_counts.get(r, 0) + 1
+                    
+                    # Build summary parts inner with name:count format
+                    summary_parts_inner = []
+                    if renderer_counts:
+                        sorted_renderers = sorted(renderer_counts.items(), key=lambda x: x[1], reverse=True)
+                        for name, cnt in sorted_renderers:
+                            summary_parts_inner.append(f"{name}:{cnt}")
+                    
+                    # Build the submission summary string
+                    if renderer_count == 0:
+                        # No renderers - only report count
+                        if renderer_count == record_count:
+                            # Renderer count matches draw count
+                            summary_part = f"sub{idx+1}({count}):[{renderer_count}]"
                         else:
-                            # Has renderers
-                            if renderer_count == record_count:
-                                # Renderer count matches draw count
-                                summary_part = f"sub{idx+1}({count}):[{renderer_count}|{','.join(summary_parts_inner)}]"
-                            else:
-                                # Renderer count doesn't match draw count
-                                summary_part = f"sub{idx+1}({count}):[{renderer_count}({record_count})|{','.join(summary_parts_inner)}]"
-                        
-                        summary_parts.append(summary_part)
+                            # Renderer count doesn't match draw count
+                            summary_part = f"sub{idx+1}({count}):[{renderer_count}({record_count})]"
+                    else:
+                        # Has renderers
+                        if renderer_count == record_count:
+                            # Renderer count matches draw count
+                            summary_part = f"sub{idx+1}({count}):[{renderer_count}|{','.join(summary_parts_inner)}]"
+                        else:
+                            # Renderer count doesn't match draw count
+                            summary_part = f"sub{idx+1}({count}):[{renderer_count}({record_count})|{','.join(summary_parts_inner)}]"
                     
-                    # Join with ", " and add a newline at the end
-                    draw_types_map[bench] = ',\n'.join(summary_parts)
-                else:
-                    draw_types_map[bench] = "No submissions"
-                    
-            except Exception as e:
-                draw_types_map[bench] = f"Error: {str(e)[:30]}"
+                    summary_parts.append(summary_part)
+                
+                # Join with ", " and add a newline at the end
+                draw_types_map[bench] = ',\n'.join(summary_parts)
+            else:
+                draw_types_map[bench] = "No submissions"
         else:
             draw_types_map[bench] = f"No JSON"
     
