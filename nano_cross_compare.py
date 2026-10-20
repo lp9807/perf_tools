@@ -1190,7 +1190,7 @@ def get_draw_type_data_from_summary(df, summary_columns):
                                         'benchmark': bench,
                                         'backend': backend_name,
                                         'summary_column': col_name,
-                                        'sub_entry': sub_entry,
+                                        'sub_entry': "",
                                         'draw_count': 0
                                     })
         
